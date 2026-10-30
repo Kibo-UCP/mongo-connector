@@ -244,15 +244,23 @@ correct core per namespace while removes keep their existing semantics.
   MUST be expanded and processed as normal entries at the parent timestamp,
   in both serial and catch-up modes; any other `applyOps` entry MUST fall
   back to serial command handling
-- **FR-008**: `DocManagerBase.bulk_apply(ops)` MUST exist with a serial
-  fallback over `upsert`/`remove` so existing doc managers work unmodified;
-  the op tuple format MUST be `(op_type, namespace, payload, timestamp)` with
-  `op_type` in `{"upsert", "remove"}`
+- **FR-008**: `DocManagerBase.bulk_apply(ops)` MUST exist with a default
+  implementation that batches consecutive `upsert` ops per namespace
+  through the doc manager's existing `bulk_upsert` method and applies
+  `remove` ops via `remove` (flushing pending upserts first to preserve
+  per-document order), so doc managers with a `bulk_upsert` implementation
+  benefit with zero changes. A `SystemExit` raised by `bulk_upsert` (as in
+  reindex-style implementations) MUST be suppressed, falling back to
+  serial `upsert` for that namespace's docs. The op tuple format MUST be
+  `(op_type, namespace, payload, timestamp)` with `op_type` in
+  `{"upsert", "remove"}`
 - **FR-009**: On `bulk_apply` failure the affected doc manager MUST replay
   that chunk serially with per-op `OperationFailed`/`ConnectionFailed`
   handling identical to the serial path
-- **FR-010**: Catch-up mode MUST NOT invoke `bulk_upsert`, which retains its
-  one-shot dump semantics (including process exit in the Solr doc managers)
+- **FR-010**: Catch-up upserts MUST be applied via `bulk_upsert` (reusing
+  each doc manager's dump code path); any `SystemExit` raised by
+  reindex-style `bulk_upsert` implementations MUST NOT terminate the
+  connector
 - **FR-011**: Unflushed buffered ops MUST be discarded on cursor exceptions;
   they are re-read from the checkpoint after reconnect
 - **FR-011a**: Buffered ops MUST be flushed when they have been pending at
@@ -262,15 +270,18 @@ correct core per namespace while removes keep their existing semantics.
   Buffer mutation, flush, and serial application MUST be serialized by a
   shared lock so a timer-triggered flush cannot interleave with or reorder
   application of newer entries
-- **FR-012**: `mongo_doc_manager.bulk_apply` MUST group writes by destination
-  collection and meta collection and issue ordered `bulk_write` calls chunked
-  at `chunk_size`, preserving per-collection op order
-- **FR-013**: The Solr doc managers MUST batch upserts per Solr core with the
-  same clean-doc, commitWithin, handler, and B2B-core-unavailable semantics
-  as `bulk_upsert`, without the reindex process exit
+- **FR-012**: `mongo_doc_manager` requires no `bulk_apply` override — its
+  existing `bulk_upsert` already issues ordered `bulk_write` calls chunked
+  at `chunk_size` on data and meta collections
+- **FR-013**: The Solr doc managers require NO changes — their existing
+  `bulk_upsert` implementations batch catch-up upserts identically to a
+  collection dump (same clean-doc, commitWithin, handler, and
+  B2B-core-unavailable semantics). Their `bulk_upsert` may call
+  `sys.exit()` when `KIBO_SOLR_REINDEX_CONTINUE_OPLOG_INDEXING` is unset;
+  the connector suppresses `SystemExit` during catch-up
 - **FR-014**: Remove ops MUST keep each doc manager's existing delete
-  semantics (order DM: log-and-skip; shipment DM: batched `solr.delete` by
-  mapped id; mongo DMs: ordered `DeleteOne` on data and meta collections)
+  semantics (order DM: log-and-skip; shipment DM: serial `solr.delete`;
+  mongo DMs: `remove`), applied after flushing pending upserts
 
 ### Key Entities
 
