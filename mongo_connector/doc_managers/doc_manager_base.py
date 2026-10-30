@@ -141,17 +141,47 @@ class DocManagerBase(object):
         - ``"remove"``: ``payload`` is the ``_id`` of the document to remove.
 
         Operations must be applied in the order given. This default
-        implementation applies each operation serially through
-        :meth:`upsert` and :meth:`remove`. Doc managers may override this to
-        apply operations in bulk.
+        implementation routes upsert ops through the existing
+        :meth:`bulk_upsert` method (batching consecutive upserts per
+        namespace, flushed before each remove to preserve ordering) and
+        remove ops through :meth:`remove`, so DocManagers that already
+        implement bulk_upsert benefit without any changes. Doc managers may
+        override this for finer-grained batching (e.g. batching removes).
         """
-        for op_type, namespace, payload, timestamp in ops:
+        pending = {}
+
+        def flush_pending():
+            for ns, entries in pending.items():
+                docs = [doc for doc, ts in entries]
+                timestamp = entries[-1][1]
+                try:
+                    self.bulk_upsert(docs, ns, timestamp)
+                except SystemExit:
+                    # Some DocManagers call sys.exit() at the end of
+                    # bulk_upsert (one-shot reindex semantics). Suppress
+                    # it during catch-up and apply this namespace's docs
+                    # serially, since their state after the exit is
+                    # unknown.
+                    LOG.warning(
+                        "bulk_upsert raised SystemExit during bulk_apply "
+                        "for namespace '%s'; applying docs serially" % ns
+                    )
+                    for doc in docs:
+                        self.upsert(doc, ns, timestamp)
+            pending.clear()
+
+        for op in ops:
+            op_type, namespace, payload, timestamp = op
             if op_type == "upsert":
-                self.upsert(payload, namespace, timestamp)
+                pending.setdefault(namespace, []).append(
+                    (payload, timestamp)
+                )
             elif op_type == "remove":
+                flush_pending()
                 self.remove(payload, namespace, timestamp)
             else:
                 raise ValueError("Unknown bulk_apply op type: %r" % (op_type,))
+        flush_pending()
 
     def update(self, doc, update_spec, namespace, timestamp):
         """Update a document.
