@@ -15,14 +15,17 @@ document write). When the connector resumes from a stale checkpoint or falls
 behind during a write burst, it must chew through the entire backlog at this
 serial rate — the slowest possible mode exactly when throughput matters most.
 
-`bulk_upsert` already exists on the doc-manager API but is only used by the
-initial/resume collection dump, and in the Kibo Solr doc managers it is
-specialized for one-shot reindexing (it exits the process when finished). This
-feature adds a streaming bulk-apply path that engages automatically when the
-oplog thread is far enough behind, without changing steady-state behavior.
-Backlog entries are normalized into per-document operations and deduplicated
-to the last op per document within each batch window, so hot documents cost
-one write instead of one write per change.
+`bulk_upsert` already exists on the doc-manager API and is used by the
+initial/resume collection dump; in the Kibo Solr doc managers it is
+specialized for one-shot reindexing (it exits the process when finished
+unless `KIBO_SOLR_REINDEX_CONTINUE_OPLOG_INDEXING` is set). This feature
+adds a streaming bulk-apply path that engages automatically when the oplog
+thread is far enough behind, **reusing each doc manager's existing
+`bulk_upsert`** for upsert batches — so the custom Solr doc managers need
+no code changes — while suppressing reindex-style `sys.exit()` calls
+during catch-up. Backlog entries are normalized into per-document
+operations and deduplicated to the last op per document within each batch
+window, so hot documents cost one write instead of one write per change.
 
 Two related replication gaps in the existing serial path were discovered
 while implementing and are addressed as part of this change:
@@ -147,32 +150,35 @@ fallback) still receives all ops correctly.
 
 ---
 
-### User Story 4 - Batched Writes to Solr Targets (Priority: P2)
+### User Story 4 - Batched Writes to Solr Targets With Zero DM Changes (Priority: P2)
 
 **Scenario**: As the owner of the order and shipment search indexes, I need
-catch-up mode to batch `solr.add` calls per core, so that Solr indexing
-throughput during backlog replay improves materially.
+catch-up mode to reuse the doc managers' existing `bulk_upsert` code, so
+that Solr indexing throughput improves during backlog replay **without
+modifying the custom doc managers**.
 
 **Why this priority**: This is where the realized speedup lands for Kibo's
-custom doc managers — single-doc `solr.add` calls are the dominant cost today.
+custom doc managers — single-doc `solr.add` calls are the dominant cost
+today — and minimizing doc-manager changes reduces rollout risk.
 
-**Independent Test**: Enable catch-up mode with the order doc manager pointed
-at Solr, generate a backlog, and verify batches of cleaned docs are sent to the
-correct core per namespace while removes keep their existing semantics.
+**Independent Test**: Enable catch-up mode with the order doc manager
+unmodified, generate a backlog, and verify upserts are batched through the
+existing `bulk_upsert` method to the correct core per namespace while
+removes keep their existing semantics.
 
 **Acceptance Scenarios**:
 
-1. **Given** the order doc manager, **When** catch-up upserts arrive for the
-   order and B2B cores, **Then** cleaned docs are batched per Solr core at
-   `bulkSize` and sent with the same `connector_update` handler and
-   commitWithin settings as `bulk_upsert`
-2. **Given** a remove op for the order doc manager, **When** it is processed,
-   **Then** it is logged and skipped, mirroring the existing `remove`
-   behavior
-3. **Given** the shipment doc manager, **When** a mixed stream of upserts and
-   removes arrives, **Then** consecutive upserts flush via batched
-   `solr.add` and consecutive removes via batched `solr.delete`, preserving
-   oplog order
+1. **Given** the order doc manager with no code changes, **When** catch-up
+   upserts arrive for the order and B2B cores, **Then** cleaned docs are
+   batched per Solr core through the DM's existing `bulk_upsert` with the
+   same `connector_update` handler and commitWithin settings as a dump
+2. **Given** a remove op for the order doc manager, **When** it is
+   processed, **Then** it is logged and skipped, mirroring the existing
+   `remove` behavior
+3. **Given** a doc manager whose `bulk_upsert` raises `SystemExit`
+   (reindex semantics), **When** catch-up flushes a batch, **Then** the
+   exit is suppressed and that namespace's docs are applied serially via
+   `upsert` instead of terminating the connector
 
 ---
 
