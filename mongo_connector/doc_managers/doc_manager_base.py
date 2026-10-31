@@ -16,7 +16,11 @@ import logging
 import sys
 
 from mongo_connector.connector import get_mininum_mongodb_version
-from mongo_connector.errors import UpdateDoesNotApply
+from mongo_connector.errors import (
+    ConnectionFailed,
+    OperationFailed,
+    UpdateDoesNotApply,
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -24,6 +28,19 @@ LOG = logging.getLogger(__name__)
 
 class DocManagerBase(object):
     """Base class for all DocManager implementations."""
+
+    # True while the default bulk_apply() is running. Doc managers whose
+    # bulk_upsert has one-shot reindex behavior (e.g. calling sys.exit() or
+    # logging end-of-job messages when finished) should check this flag and
+    # skip that behavior during oplog catch-up.
+    _in_bulk_apply = False
+
+    # When True, OplogThread resolves modifier/diff updates buffered during
+    # bulk catch-up by fetching the WHOLE source document, ignoring the
+    # namespace's includeFields/excludeFields projection. Set this on doc
+    # managers whose serial update() refetches the full source document, so
+    # catch-up produces the same documents as serial application.
+    catchup_fetch_full_document = False
 
     def apply_update(self, doc, update_spec):
         """Apply an update operation to a document."""
@@ -136,52 +153,100 @@ class DocManagerBase(object):
         of:
 
         - ``"upsert"``: ``payload`` is the full document to upsert. Modifier
-          updates (``$set``/``$unset`` oplog entries) are resolved to whole
-          documents by the OplogThread before reaching this method.
+          updates (``$set``/``$unset``/``diff`` oplog entries) are resolved
+          to whole documents by the OplogThread before reaching this method.
         - ``"remove"``: ``payload`` is the ``_id`` of the document to remove.
 
         Operations must be applied in the order given. This default
         implementation routes upsert ops through the existing
         :meth:`bulk_upsert` method (batching consecutive upserts per
         namespace, flushed before each remove to preserve ordering) and
-        remove ops through :meth:`remove`, so DocManagers that already
-        implement bulk_upsert benefit without any changes. Doc managers may
-        override this for finer-grained batching (e.g. batching removes).
+        remove ops through :meth:`remove`. Doc managers may override this
+        for finer-grained batching (e.g. batching removes).
+
+        Contract for doc managers relying on this default implementation:
+
+        - ``self._in_bulk_apply`` is True for the duration of the call, so
+          a doc manager can tell a catch-up ``bulk_upsert`` apart from a
+          one-shot reindex ``bulk_upsert`` (e.g. to skip ``sys.exit()``).
+        - ``bulk_upsert`` receives an *iterator* of shallow copies of the
+          buffered documents; every serial fallback ``upsert`` receives a
+          fresh shallow copy too, so a doc manager may mutate what it is
+          given.
+        - Every ``bulk_upsert`` and fallback ``upsert`` is stamped with the
+          minimum timestamp across the whole ``ops`` list. Restarting from
+          the doc manager's newest ``_ts`` then never skips an op in this
+          call; reapplying ops is idempotent.
+        - If ``bulk_upsert`` raises anything other than
+          :class:`~mongo_connector.errors.ConnectionFailed`, the
+          namespace's documents are re-applied one at a time with
+          :meth:`upsert` so a bad document is isolated; a single document's
+          :class:`~mongo_connector.errors.OperationFailed` is logged and
+          skipped, as in serial oplog application. ``ConnectionFailed`` is
+          propagated so the caller does not checkpoint past unapplied ops.
         """
+        ops = list(ops)
+        for op in ops:
+            if op[0] not in ("upsert", "remove"):
+                raise ValueError("Unknown bulk_apply op type: %r" % (op[0],))
+        if not ops:
+            return
+        timestamp = min(op[3] for op in ops)
         pending = {}
 
         def flush_pending():
-            for ns, entries in pending.items():
-                docs = [doc for doc, ts in entries]
-                timestamp = entries[-1][1]
-                try:
-                    self.bulk_upsert(docs, ns, timestamp)
-                except SystemExit:
-                    # Some DocManagers call sys.exit() at the end of
-                    # bulk_upsert (one-shot reindex semantics). Suppress
-                    # it during catch-up and apply this namespace's docs
-                    # serially, since their state after the exit is
-                    # unknown.
-                    LOG.warning(
-                        "bulk_upsert raised SystemExit during bulk_apply "
-                        "for namespace '%s'; applying docs serially" % ns
-                    )
-                    for doc in docs:
-                        self.upsert(doc, ns, timestamp)
+            for ns, docs in pending.items():
+                self._bulk_apply_upserts(docs, ns, timestamp)
             pending.clear()
 
-        for op in ops:
-            op_type, namespace, payload, timestamp = op
-            if op_type == "upsert":
-                pending.setdefault(namespace, []).append(
-                    (payload, timestamp)
+        self._in_bulk_apply = True
+        try:
+            for op_type, namespace, payload, op_timestamp in ops:
+                if op_type == "upsert":
+                    pending.setdefault(namespace, []).append(payload)
+                else:
+                    flush_pending()
+                    try:
+                        self.remove(payload, namespace, op_timestamp)
+                    except OperationFailed:
+                        LOG.exception(
+                            "Unable to remove document %r from namespace "
+                            "'%s' during bulk_apply" % (payload, namespace)
+                        )
+            flush_pending()
+        finally:
+            self._in_bulk_apply = False
+
+    def _bulk_apply_upserts(self, docs, namespace, timestamp):
+        """Upsert one namespace's docs for bulk_apply via bulk_upsert,
+        falling back to per-document upserts on failure."""
+        try:
+            self.bulk_upsert(iter([dict(d) for d in docs]), namespace, timestamp)
+            return
+        except SystemExit:
+            # Some DocManagers call sys.exit() at the end of bulk_upsert
+            # (one-shot reindex semantics). Suppress it during catch-up and
+            # apply this namespace's docs serially, since their state after
+            # the exit is unknown.
+            LOG.warning(
+                "bulk_upsert raised SystemExit during bulk_apply "
+                "for namespace '%s'; applying docs serially" % namespace
+            )
+        except ConnectionFailed:
+            raise
+        except Exception:
+            LOG.exception(
+                "bulk_upsert failed during bulk_apply for namespace '%s'; "
+                "applying %d docs serially" % (namespace, len(docs))
+            )
+        for doc in docs:
+            try:
+                self.upsert(dict(doc), namespace, timestamp)
+            except OperationFailed:
+                LOG.exception(
+                    "Unable to upsert document %r into namespace '%s' "
+                    "during bulk_apply" % (doc.get("_id"), namespace)
                 )
-            elif op_type == "remove":
-                flush_pending()
-                self.remove(payload, namespace, timestamp)
-            else:
-                raise ValueError("Unknown bulk_apply op type: %r" % (op_type,))
-        flush_pending()
 
     def update(self, doc, update_spec, namespace, timestamp):
         """Update a document.

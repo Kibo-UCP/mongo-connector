@@ -209,6 +209,7 @@ class Connector(threading.Thread):
             only_dump=config["onlyDump"],
             batch_size=config["batchSize"],
             bulk_apply_lag_seconds=config["bulkApplyLagSeconds"],
+            bulk_apply_exit_lag_seconds=config["bulkApplyExitLagSeconds"],
             bulk_apply_batch_size=config["bulkApplyBatchSize"],
             bulk_apply_idle_seconds=config["bulkApplyIdleSeconds"],
             continue_on_error=config["continueOnError"],
@@ -582,10 +583,24 @@ def get_config_options():
         "of falling behind the earliest timestamp in the oplog",
     )
 
+    def make_apply_int_minimum(config_key, minimum):
+        """Return an apply_function that rejects values below ``minimum``."""
+
+        def apply_int_minimum(option, cli_values):
+            config.default_apply_function(option, cli_values)
+            if option.value is None or option.value < minimum:
+                raise errors.InvalidConfiguration(
+                    "%s must be an integer >= %d, got %r."
+                    % (config_key, minimum, option.value)
+                )
+
+        return apply_int_minimum
+
     bulk_apply_lag_seconds = add_option(
         config_key="bulkApplyLagSeconds",
         default=constants.DEFAULT_BULK_APPLY_LAG_SECONDS,
         type=int,
+        apply_function=make_apply_int_minimum("bulkApplyLagSeconds", 0),
     )
 
     # --bulk-apply-lag-seconds enables buffered bulk application of oplog
@@ -602,8 +617,30 @@ def get_config_options():
         % constants.DEFAULT_BULK_APPLY_LAG_SECONDS,
     )
 
+    bulk_apply_exit_lag_seconds = add_option(
+        config_key="bulkApplyExitLagSeconds",
+        default=constants.DEFAULT_BULK_APPLY_EXIT_LAG_SECONDS,
+        type=int,
+        apply_function=make_apply_int_minimum("bulkApplyExitLagSeconds", 0),
+    )
+
+    bulk_apply_exit_lag_seconds.add_cli(
+        "--bulk-apply-exit-lag-seconds",
+        type="int",
+        dest="bulk_apply_exit_lag_seconds",
+        help="Once in bulk catch-up mode, keep buffering and applying in "
+        "bulk until the connector is within this many seconds of the "
+        "newest oplog entry. Prevents flapping between serial and bulk "
+        "application around --bulk-apply-lag-seconds. Values at or above "
+        "--bulk-apply-lag-seconds are clamped to it. Defaults to %d "
+        "seconds (1 minute)." % constants.DEFAULT_BULK_APPLY_EXIT_LAG_SECONDS,
+    )
+
     bulk_apply_batch_size = add_option(
-        config_key="bulkApplyBatchSize", default=constants.DEFAULT_MAX_BULK, type=int
+        config_key="bulkApplyBatchSize",
+        default=constants.DEFAULT_MAX_BULK,
+        type=int,
+        apply_function=make_apply_int_minimum("bulkApplyBatchSize", 1),
     )
 
     bulk_apply_batch_size.add_cli(
@@ -619,6 +656,7 @@ def get_config_options():
         config_key="bulkApplyIdleSeconds",
         default=constants.DEFAULT_BULK_APPLY_IDLE_SECONDS,
         type=int,
+        apply_function=make_apply_int_minimum("bulkApplyIdleSeconds", 0),
     )
 
     bulk_apply_idle_seconds.add_cli(

@@ -36,6 +36,7 @@ from mongo_connector import errors, util
 from mongo_connector.util import hello_or_ismaster
 from mongo_connector.constants import (
     DEFAULT_BATCH_SIZE,
+    DEFAULT_BULK_APPLY_EXIT_LAG_SECONDS,
     DEFAULT_BULK_APPLY_IDLE_SECONDS,
     DEFAULT_BULK_APPLY_LAG_SECONDS,
     DEFAULT_MAX_BULK,
@@ -48,6 +49,37 @@ LOG = logging.getLogger(__name__)
 # How often (in processed oplog entries) to refresh the cached timestamp of
 # the newest oplog entry when deciding whether we are in catch-up mode.
 BULK_LAG_REFRESH_ENTRIES = 500
+
+# Upper bound (in seconds) of the exponential backoff applied before
+# re-reading the oplog from the checkpoint after a catch-up flush failed
+# with a connection error.
+BULK_FLUSH_MAX_BACKOFF_SECONDS = 60
+
+
+class CatchupFlushFailed(Exception):
+    """Raised when buffered catch-up ops could not be applied because a doc
+    manager lost its connection to the target system.
+
+    The buffer has been discarded and the checkpoint was not advanced past
+    the unapplied ops; the oplog must be re-read from the checkpoint.
+    """
+
+
+def _ts_as_long(ts):
+    """Return a bson.Timestamp (or an already-converted long) as a long."""
+    if isinstance(ts, bson.Timestamp):
+        return util.bson_ts_to_long(ts)
+    return ts
+
+
+def _catchup_doc_key(doc_id):
+    """Return a hashable key identifying a document ``_id``.
+
+    ``_id`` values may be unhashable (e.g. compound/dict ids). The BSON
+    encoding of ``{"_id": doc_id}`` is hashable and distinguishes values
+    Python would treat as equal (e.g. ``1`` and ``True``).
+    """
+    return bson.encode({"_id": doc_id})
 
 
 class ReplicationLagLogger(threading.Thread):
@@ -92,11 +124,22 @@ class ReplicationLagLogger(threading.Thread):
 
     def run(self):
         while self.opman.is_alive():
-            # The tailable oplog cursor blocks awaiting new data at the
-            # tail, so a separate thread is needed to flush an under-full
-            # catch-up buffer on an idle source.
-            self.opman._maybe_flush_idle_buffer()
-            self.log_replication_lag()
+            # An exception here (e.g. get_last_oplog_timestamp returning
+            # None, or retry_until_ok giving up) must not kill the thread:
+            # the idle flush of the catch-up buffer depends on it.
+            try:
+                # The tailable oplog cursor blocks awaiting new data at the
+                # tail, so a separate thread is needed to flush an
+                # under-full catch-up buffer on an idle source.
+                self.opman._maybe_flush_idle_buffer()
+                self.log_replication_lag()
+            except Exception:
+                LOG.exception(
+                    "ReplicationLagLogger for replica set '%s' failed; "
+                    "retrying in %s seconds",
+                    self.opman.replset_name,
+                    self.interval,
+                )
             time.sleep(self.interval)
 
 
@@ -160,6 +203,31 @@ class OplogThread(threading.Thread):
             or 0
         )
 
+        # Once in bulk catch-up mode, stay in it until lag drops to this many
+        # seconds. Never above the entry threshold, so the exit can't be
+        # stricter than the entry (exit == lag gives single-threshold
+        # behavior).
+        exit_lag = kwargs.get(
+            "bulk_apply_exit_lag_seconds", DEFAULT_BULK_APPLY_EXIT_LAG_SECONDS
+        )
+        if exit_lag is None:
+            exit_lag = DEFAULT_BULK_APPLY_EXIT_LAG_SECONDS
+        if self.bulk_apply_lag_seconds > 0 and exit_lag > self.bulk_apply_lag_seconds:
+            LOG.warning(
+                "OplogThread: bulkApplyExitLagSeconds (%d) is above "
+                "bulkApplyLagSeconds (%d); using %d.",
+                exit_lag,
+                self.bulk_apply_lag_seconds,
+                self.bulk_apply_lag_seconds,
+            )
+            exit_lag = self.bulk_apply_lag_seconds
+        self.bulk_apply_exit_lag_seconds = min(
+            exit_lag, self.bulk_apply_lag_seconds or exit_lag
+        )
+        # True while buffering in bulk; flips with hysteresis in
+        # _is_behind_oplog.
+        self._catchup_mode_active = False
+
         # Number of oplog entries to buffer before flushing them in bulk.
         self.bulk_apply_batch_size = kwargs.get(
             "bulk_apply_batch_size", DEFAULT_MAX_BULK
@@ -175,12 +243,20 @@ class OplogThread(threading.Thread):
         )
 
         # Normalized ops buffered for bulk application while catching up.
-        # Keyed by (namespace, doc _id) so that only the last op per
-        # document in a flush window is applied; the buffer flushes once it
-        # holds bulk_apply_batch_size deduplicated documents.
+        # Keyed by (namespace, BSON-encoded {"_id": doc _id}) so that only
+        # the last op per document in a flush window is applied; the buffer
+        # flushes once it holds bulk_apply_batch_size deduplicated documents.
         self._catchup_ops = {}
-        # Timestamp of the last buffered entry; checkpointed after a flush.
+        # Timestamp of the newest entry read while the buffer was non-empty
+        # (buffered or skipped); checkpointed after a successful flush. The
+        # checkpoint never moves past buffered ops before they are applied.
         self._catchup_last_ts = None
+        # Set when a flush failed with ConnectionFailed and the buffer was
+        # discarded: the run loop must re-read the oplog from the
+        # checkpoint before applying or checkpointing anything else.
+        self._catchup_restart_required = False
+        # Consecutive failed flushes, used for the restart backoff.
+        self._catchup_flush_failures = 0
         # Cached newest oplog timestamp used for lag decisions.
         self._newest_oplog_ts = None
         self._entries_since_lag_check = 0
@@ -299,8 +375,13 @@ class OplogThread(threading.Thread):
         return self.bulk_apply_lag_seconds > 0
 
     def _is_behind_oplog(self, entry):
-        """Determine if an oplog entry is far enough behind the newest entry
-        to warrant bulk catch-up application.
+        """Determine if an oplog entry should be applied in bulk catch-up mode.
+
+        Bulk mode is entered when the entry is more than
+        bulk_apply_lag_seconds behind the newest oplog entry, and left only
+        once the lag is down to bulk_apply_exit_lag_seconds. The lower exit
+        threshold stops the connector flapping between serial and bulk
+        application around a single threshold.
 
         The newest oplog timestamp is cached and refreshed every
         BULK_LAG_REFRESH_ENTRIES processed entries.
@@ -314,8 +395,22 @@ class OplogThread(threading.Thread):
             self._entries_since_lag_check = 0
         newest = self._newest_oplog_ts
         if newest is None:
-            return False
-        return (newest.time - entry["ts"].time) > self.bulk_apply_lag_seconds
+            return self._catchup_mode_active
+        lag = newest.time - entry["ts"].time
+        threshold = (
+            self.bulk_apply_exit_lag_seconds
+            if self._catchup_mode_active
+            else self.bulk_apply_lag_seconds
+        )
+        active = lag > threshold
+        if active != self._catchup_mode_active:
+            LOG.info(
+                "OplogThread: %s bulk catch-up mode (lag %ds)",
+                "entering" if active else "leaving",
+                lag,
+            )
+            self._catchup_mode_active = active
+        return active
 
     def _buffer_oplog_entry(self, entry, ns, timestamp):
         """Buffer a normalized op for this entry, deduplicated per document.
@@ -326,7 +421,12 @@ class OplogThread(threading.Thread):
         every op carries the document's complete state (or resolves to it at
         flush time), so intermediate ops for the same document are
         redundant. Modifier updates are buffered as "fetch" ops and resolved
-        to whole documents at flush time.
+        to whole documents at flush time. Replacement updates are buffered
+        as "replace" ops carrying the (field-filtered) replacement document;
+        at flush time they become upserts of that payload, or fetches for
+        doc managers that set ``catchup_fetch_full_document`` (whose serial
+        update() refetches the full source document). "fetch" and "replace"
+        are internal op types that never reach a doc manager.
         """
         operation = entry["op"]
         if operation == "i":
@@ -335,21 +435,27 @@ class OplogThread(threading.Thread):
         elif operation == "u":
             doc_id = entry["o2"]["_id"]
             update_spec = entry["o"]
-            if (
+            doc = None
+            if not (
                 "$set" in update_spec
                 or "$unset" in update_spec
                 or "diff" in update_spec
             ):
-                # Modifier update. MongoDB < 5.0 uses $set/$unset specs,
-                # MongoDB >= 5.0 uses "diff" specs. Resolve the current
-                # document from the source at flush time.
-                op = ("fetch", ns, doc_id, timestamp)
-            else:
                 # Replacement-style update: 'o' holds the new document.
                 doc = dict(update_spec)
                 doc.pop("$v", None)
+                doc.pop("_id", None)
+            if doc:
                 doc["_id"] = doc_id
-                op = ("upsert", ns, doc, timestamp)
+                op = ("replace", ns, doc, timestamp)
+            else:
+                # Modifier update (MongoDB < 5.0 $set/$unset specs or
+                # MongoDB >= 5.0 "diff" specs), or a replacement payload
+                # with nothing besides _id (e.g. emptied by field
+                # filtering). Upserting that payload would wipe the
+                # destination document, so resolve the current document
+                # from the source at flush time instead.
+                op = ("fetch", ns, doc_id, timestamp)
         elif operation == "d":
             doc_id = entry["o"]["_id"]
             op = ("remove", ns, doc_id, timestamp)
@@ -358,18 +464,43 @@ class OplogThread(threading.Thread):
         with self._catchup_lock:
             if not self._catchup_ops:
                 self._catchup_first_buffered_at = time.time()
-            self._catchup_ops[(ns, doc_id)] = op
+            self._catchup_ops[(ns, _catchup_doc_key(doc_id))] = op
             self._catchup_last_ts = entry["ts"]
 
-    def _resolve_catchup_fetches(self, ops):
+    def _resolve_catchup_fetches(self, ops, full_document=False):
         """Replace "fetch" ops with "upsert"/"remove" ops by retrieving the
         current version of each document from the source with batched $in
         queries. Documents no longer present in the source become removes.
+
+        When ``full_document`` is True the namespace projection
+        (includeFields/excludeFields) is not applied, for doc managers that
+        set ``catchup_fetch_full_document``, and "replace" ops are resolved
+        by fetch as well, since their payload was trimmed by field
+        filtering while those doc managers' serial update() refetches the
+        whole source document. Otherwise "replace" ops become upserts of
+        their payload without querying the source.
+
+        The result only contains "upsert" and "remove" ops.
         """
+        if full_document:
+            ops = [
+                ("fetch", ns, payload["_id"], ts)
+                if op_type == "replace"
+                else (op_type, ns, payload, ts)
+                for op_type, ns, payload, ts in ops
+            ]
+        else:
+            ops = [
+                ("upsert", ns, payload, ts)
+                if op_type == "replace"
+                else (op_type, ns, payload, ts)
+                for op_type, ns, payload, ts in ops
+            ]
+        # ns -> {hashable id key: real _id}
         ids_by_ns = {}
         for op_type, ns, doc_id, _ in ops:
             if op_type == "fetch":
-                ids_by_ns.setdefault(ns, set()).add(doc_id)
+                ids_by_ns.setdefault(ns, {})[_catchup_doc_key(doc_id)] = doc_id
         if not ids_by_ns:
             return ops
 
@@ -381,85 +512,167 @@ class OplogThread(threading.Thread):
             collection = client[database].with_options(
                 codec_options=self._codec_options
             )[coll]
+            if full_document:
+                projection = None
+            else:
+                projection = self.namespace_config.projection(src_ns)
             found = retry_until_ok(
-                lambda: list(
-                    collection.find(
-                        {"_id": {"$in": list(doc_ids)}},
-                        projection=self.namespace_config.projection(src_ns),
-                    )
-                )
+                self._find_by_ids, collection, list(doc_ids.values()), projection
             )
             for doc in found:
-                docs[(ns, doc["_id"])] = doc
+                docs[(ns, _catchup_doc_key(doc["_id"]))] = doc
 
         resolved = []
         for op_type, ns, payload, ts in ops:
             if op_type != "fetch":
                 resolved.append((op_type, ns, payload, ts))
-            elif (ns, payload) in docs:
-                resolved.append(("upsert", ns, docs[(ns, payload)], ts))
+                continue
+            doc = docs.get((ns, _catchup_doc_key(payload)))
+            if doc is not None:
+                resolved.append(("upsert", ns, doc, ts))
             else:
                 resolved.append(("remove", ns, payload, ts))
         return resolved
 
+    @staticmethod
+    def _find_by_ids(collection, doc_ids, projection):
+        return list(collection.find({"_id": {"$in": doc_ids}}, projection=projection))
+
     def _apply_ops_serially(self, dm, ops):
-        """Fallback path applying normalized ops one at a time."""
+        """Fallback path applying normalized ops one at a time.
+
+        Each upsert gets a fresh shallow copy of the document since doc
+        managers may mutate it. A single op's OperationFailed is logged and
+        skipped, as in serial oplog application; ConnectionFailed is
+        propagated so the checkpoint is not advanced past unapplied ops.
+        """
         for op_type, ns, payload, ts in ops:
             try:
                 if op_type == "upsert":
-                    dm.upsert(payload, ns, ts)
+                    dm.upsert(dict(payload), ns, ts)
                 elif op_type == "remove":
                     dm.remove(payload, ns, ts)
             except errors.OperationFailed:
                 LOG.exception(
                     "Unable to apply %s op for namespace '%s'" % (op_type, ns)
                 )
-            except errors.ConnectionFailed:
-                LOG.exception(
-                    "Connection failed applying %s op for namespace '%s'"
-                    % (op_type, ns)
+
+    def _apply_catchup_ops(self, ops):
+        """Apply buffered ops to every doc manager.
+
+        Fetch ops are resolved once per projection kind: doc managers with
+        ``catchup_fetch_full_document`` get unprojected source documents,
+        the others get documents projected by the namespace configuration.
+        If a doc manager's bulk_apply fails with anything other than
+        ConnectionFailed, the ops are replayed serially for that doc manager.
+        """
+        resolved_by_kind = {}
+        for dm in self.doc_managers:
+            full_document = bool(getattr(dm, "catchup_fetch_full_document", False))
+            if full_document not in resolved_by_kind:
+                resolved_by_kind[full_document] = self._resolve_catchup_fetches(
+                    ops, full_document=full_document
+                )
+            dm_ops = resolved_by_kind[full_document]
+            bulk_apply = getattr(dm, "bulk_apply", None)
+            if bulk_apply is not None:
+                try:
+                    bulk_apply(dm_ops)
+                    continue
+                except errors.ConnectionFailed:
+                    raise
+                except Exception:
+                    LOG.exception(
+                        "Error during bulk apply for doc manager %r, "
+                        "replaying buffered ops serially" % (dm,)
+                    )
+            self._apply_ops_serially(dm, dm_ops)
+
+    def _discard_catchup_buffer(self):
+        with self._catchup_lock:
+            self._catchup_ops = {}
+            self._catchup_last_ts = None
+            self._catchup_first_buffered_at = None
+
+    def _check_catchup_restart(self):
+        """Raise CatchupFlushFailed if a failed flush (possibly on the idle
+        flush thread) requires re-reading the oplog from the checkpoint."""
+        with self._catchup_lock:
+            if self._catchup_restart_required:
+                raise CatchupFlushFailed(
+                    "a previous catch-up flush failed; the oplog must be "
+                    "re-read from the checkpoint"
                 )
 
-    def _flush_catchup_ops(self):
+    def _flush_catchup_ops(self, defer_checkpoint_at=None):
         """Flush buffered catch-up ops to each doc manager and checkpoint.
 
-        If a doc manager's bulk_apply fails, that doc manager falls back to
-        applying the buffered ops serially.
+        Returns True if buffered ops were applied and the checkpoint was
+        advanced past them.
+
+        ``defer_checkpoint_at`` is the timestamp of an oplog entry that is
+        only partially processed (an applyOps entry whose sub-ops share its
+        ts). If the newest buffered ts is not older than it, the ops are
+        applied but the checkpoint is not advanced and False is returned:
+        the checkpointed entry is not re-read on restart, so its ts may
+        only be checkpointed once every sibling sub-op has been applied.
+
+        If a doc manager raises ConnectionFailed the buffer is discarded,
+        the checkpoint is left where it was, and CatchupFlushFailed is
+        raised; the run loop then re-reads the oplog from the checkpoint.
         """
         with self._catchup_lock:
+            self._check_catchup_restart()
             if not self._catchup_ops:
-                return
-            ops = self._resolve_catchup_fetches(
-                list(self._catchup_ops.values())
-            )
-            for dm in self.doc_managers:
-                bulk_apply = getattr(dm, "bulk_apply", None)
-                if bulk_apply is not None:
-                    try:
-                        bulk_apply(ops)
-                        continue
-                    except Exception:
-                        LOG.exception(
-                            "Error during bulk apply for doc manager %r, "
-                            "replaying buffered ops serially" % (dm,)
-                        )
-                self._apply_ops_serially(dm, ops)
-            self._catchup_ops = {}
-            self._catchup_first_buffered_at = None
-            if self._catchup_last_ts is not None:
-                self.update_checkpoint(self._catchup_last_ts)
-                self._catchup_last_ts = None
+                return False
+            try:
+                self._apply_catchup_ops(list(self._catchup_ops.values()))
+            except errors.ConnectionFailed:
+                LOG.exception(
+                    "OplogThread: connection failed applying %d buffered "
+                    "catch-up ops; discarding them and re-reading the oplog "
+                    "from checkpoint %s",
+                    len(self._catchup_ops),
+                    self.checkpoint,
+                )
+                self._discard_catchup_buffer()
+                self._catchup_restart_required = True
+                self._catchup_flush_failures += 1
+                raise CatchupFlushFailed("connection failed during flush")
+            last_ts = self._catchup_last_ts
+            self._discard_catchup_buffer()
+            self._catchup_flush_failures = 0
+            if (
+                defer_checkpoint_at is not None
+                and last_ts is not None
+                and _ts_as_long(last_ts) >= _ts_as_long(defer_checkpoint_at)
+            ):
+                return False
+            self._advance_checkpoint(last_ts)
+            return True
+
+    def _catchup_restart_backoff(self):
+        """Seconds to wait before re-reading the oplog after a failed flush."""
+        failures = max(self._catchup_flush_failures, 1)
+        return min(2 ** failures, BULK_FLUSH_MAX_BACKOFF_SECONDS)
 
     def _maybe_flush_idle_buffer(self):
         """Flush the catch-up buffer if it has been pending too long.
 
         A tailable cursor blocks awaiting new data at the tail, so when the
         backlog is smaller than bulk_apply_batch_size buffered ops would
-        otherwise sit unapplied until the next relevant entry arrives. This
-        check runs for every entry read (including skipped/no-op entries,
-        which arrive periodically on an idle replica set), so an under-full
-        buffer flushes within roughly bulk_apply_idle_seconds plus the
-        source's heartbeat interval.
+        otherwise sit unapplied until the next relevant entry arrives. The
+        oplog cursor filters out no-op entries (``op != "n"``), so nothing
+        arrives on an idle source: this check runs on the
+        ReplicationLagLogger thread (every 30 seconds) as well as before each
+        oplog entry the run loop processes, so an under-full buffer flushes
+        within roughly bulk_apply_idle_seconds plus 30 seconds.
+
+        The flush takes ``_catchup_lock``, which the run loop holds while
+        processing an oplog entry (including every sub-op of an expanded
+        applyOps entry), so it never runs between sibling sub-ops. A failed
+        flush only sets ``_catchup_restart_required``; the run loop checks
+        it and re-reads the oplog from the checkpoint.
         """
         with self._catchup_lock:
             try:
@@ -478,6 +691,10 @@ class OplogThread(threading.Thread):
                         len(self._catchup_ops),
                     )
                     self._flush_catchup_ops()
+            except CatchupFlushFailed:
+                # The run loop notices _catchup_restart_required and
+                # re-reads the oplog from the checkpoint.
+                LOG.warning("Idle flush of catch-up buffer failed")
             except Exception:
                 LOG.exception("Error flushing idle catch-up buffer")
 
@@ -488,6 +705,12 @@ class OplogThread(threading.Thread):
         ReplicationLagLogger(self, 30).start()
         LOG.debug("OplogThread: Run thread started")
         while self.running is True:
+            # A new cursor re-reads from the checkpoint, which never moved
+            # past ops lost by a failed catch-up flush.
+            with self._catchup_lock:
+                if self._catchup_restart_required:
+                    self._discard_catchup_buffer()
+                    self._catchup_restart_required = False
             LOG.debug("OplogThread: Getting cursor")
             cursor, cursor_empty = retry_until_ok(self.init_cursor)
             # we've fallen too far behind
@@ -514,6 +737,10 @@ class OplogThread(threading.Thread):
             try:
                 LOG.debug("OplogThread: about to process new oplog entries")
                 while cursor.alive and self.running:
+                    # A flush that failed on the idle-flush thread while the
+                    # source was quiet must trigger the re-read promptly,
+                    # not only once another oplog entry arrives.
+                    self._check_catchup_restart()
                     LOG.debug(
                         "OplogThread: Cursor is still"
                         " alive and thread is still running."
@@ -528,49 +755,74 @@ class OplogThread(threading.Thread):
                             " document number in this cursor is %d" % n
                         )
 
-                        for entry in self._expand_apply_ops(entry):
-                            self._maybe_flush_idle_buffer()
+                        self._maybe_flush_idle_buffer()
 
-                            skip, is_gridfs_file = self._should_skip_entry(entry)
-                            if skip:
-                                # update the last_ts on skipped entries to ensure
-                                # our checkpoint does not fall off the oplog. This
-                                # also prevents reprocessing skipped entries.
-                                last_ts = entry["ts"]
-                                continue
+                        # Process the whole oplog entry atomically with
+                        # respect to flushing and checkpointing. Sub-ops of
+                        # an expanded applyOps entry share its ts, and the
+                        # checkpointed entry is not re-read on restart, so
+                        # no flush (idle or batch-size) may checkpoint that
+                        # ts until every sibling has been applied or
+                        # buffered. Holding the lock also keeps the idle
+                        # flush from interleaving with serial application.
+                        with self._catchup_lock:
+                            self._check_catchup_restart()
+                            parent_ts = entry["ts"]
+                            for entry in self._expand_apply_ops(entry):
+                                skip, is_gridfs_file = self._should_skip_entry(entry)
+                                if skip:
+                                    # update the last_ts on skipped entries to
+                                    # ensure our checkpoint does not fall off
+                                    # the oplog. This also prevents
+                                    # reprocessing skipped entries. While
+                                    # catch-up ops are buffered, the skipped
+                                    # entry's ts is only checkpointed once
+                                    # they are flushed, so the checkpoint
+                                    # never moves past unapplied ops.
+                                    if self._catchup_ops:
+                                        self._catchup_last_ts = entry["ts"]
+                                    else:
+                                        last_ts = entry["ts"]
+                                    continue
 
-                            # Sync the current oplog operation
-                            operation = entry["op"]
-                            ns = entry["ns"]
-                            timestamp = util.bson_ts_to_long(entry["ts"])
+                                # Sync the current oplog operation
+                                operation = entry["op"]
+                                ns = entry["ns"]
+                                timestamp = util.bson_ts_to_long(entry["ts"])
 
-                            # Commands and GridFS file writes must be applied
-                            # serially in oplog order; other operations may be
-                            # buffered and applied in bulk while behind.
-                            if (
-                                self._bulk_catchup_enabled()
-                                and not is_gridfs_file
-                                and operation != "c"
-                                and self._is_behind_oplog(entry)
-                            ):
-                                self._buffer_oplog_entry(entry, ns, timestamp)
-                                bulk_inc += 1
+                                # Commands and GridFS file writes must be
+                                # applied serially in oplog order; other
+                                # operations may be buffered and applied in
+                                # bulk while behind.
                                 if (
-                                    len(self._catchup_ops)
-                                    >= self.bulk_apply_batch_size
+                                    self._bulk_catchup_enabled()
+                                    and not is_gridfs_file
+                                    and operation != "c"
+                                    and self._is_behind_oplog(entry)
                                 ):
-                                    self._flush_catchup_ops()
-                                continue
+                                    self._buffer_oplog_entry(entry, ns, timestamp)
+                                    bulk_inc += 1
+                                    # last_ts must strictly precede every
+                                    # buffered op: a skipped or serially
+                                    # applied sibling's ts may only be
+                                    # checkpointed by the flush.
+                                    if (
+                                        last_ts is not None
+                                        and _ts_as_long(last_ts) >= timestamp
+                                    ):
+                                        last_ts = None
+                                    continue
 
-                            # Flush buffered ops before serially applying this
-                            # entry to preserve oplog ordering.
-                            if self._catchup_ops:
-                                self._flush_catchup_ops()
+                                # Flush buffered ops before serially applying
+                                # this entry to preserve oplog ordering. If
+                                # siblings sharing parent_ts are buffered,
+                                # the flush must not checkpoint parent_ts:
+                                # later siblings are not processed yet.
+                                if self._catchup_ops and self._flush_catchup_ops(
+                                    defer_checkpoint_at=parent_ts
+                                ):
+                                    last_ts = None
 
-                            # The lock prevents a timer-triggered flush
-                            # from interleaving with serial application
-                            # of a newer entry.
-                            with self._catchup_lock:
                                 for docman in self.doc_managers:
                                     try:
                                         LOG.debug(
@@ -622,27 +874,41 @@ class OplogThread(threading.Thread):
                                             "document %r" % entry
                                         )
 
-                            if (remove_inc + upsert_inc + update_inc) % 1000 == 0:
-                                LOG.debug(
-                                    "OplogThread: Documents removed: %d, "
-                                    "inserted: %d, updated: %d so far"
-                                    % (remove_inc, upsert_inc, update_inc)
-                                )
+                                if (remove_inc + upsert_inc + update_inc) % 1000 == 0:
+                                    LOG.debug(
+                                        "OplogThread: Documents removed: %d, "
+                                        "inserted: %d, updated: %d so far"
+                                        % (remove_inc, upsert_inc, update_inc)
+                                    )
 
-                            LOG.debug("OplogThread: Doc is processed.")
+                                LOG.debug("OplogThread: Doc is processed.")
 
-                            last_ts = entry["ts"]
+                                last_ts = entry["ts"]
 
-                            # update timestamp per batch size
-                            # n % -1 (default for self.batch_size) == 0 for all n
-                            if n % self.batch_size == 1:
-                                self.update_checkpoint(last_ts)
+                            # The entry is fully processed, so the batch-size
+                            # flush may now checkpoint its ts.
+                            if (
+                                len(self._catchup_ops)
+                                >= self.bulk_apply_batch_size
+                                and self._flush_catchup_ops()
+                            ):
+                                # The flush checkpointed past last_ts.
                                 last_ts = None
+
+                        # update timestamp per batch size
+                        # n % -1 (default for self.batch_size) == 0 for all n
+                        if n % self.batch_size == 1:
+                            self._advance_checkpoint(last_ts)
+                            last_ts = None
+
+                    # A flush that failed on the idle-flush thread must not
+                    # be followed by checkpointing anything else.
+                    self._check_catchup_restart()
 
                     # flush any remaining buffered ops before recording the
                     # checkpoint; flushing updates the checkpoint itself.
-                    if self._catchup_ops:
-                        self._flush_catchup_ops()
+                    if self._catchup_ops and self._flush_catchup_ops():
+                        last_ts = None
 
                     # update timestamp after running through oplog
                     if last_ts is not None:
@@ -650,7 +916,7 @@ class OplogThread(threading.Thread):
                             "OplogThread: updating checkpoint after "
                             "processing new oplog entries"
                         )
-                        self.update_checkpoint(last_ts)
+                        self._advance_checkpoint(last_ts)
 
             except (
                 pymongo.errors.AutoReconnect,
@@ -661,12 +927,27 @@ class OplogThread(threading.Thread):
                     "Cursor closed due to an exception. " "Will attempt to reconnect."
                 )
                 # Discard unflushed buffered ops: the checkpoint has not
-                # advanced past them, so they will be read again after
+                # advanced past them (last_ts always precedes the first
+                # buffered op), so they will be read again after
                 # reconnecting.
+                self._discard_catchup_buffer()
+            except CatchupFlushFailed:
+                # A doc manager lost its connection while applying buffered
+                # ops. The buffer was discarded without checkpointing; drop
+                # last_ts too and re-read the oplog from the checkpoint
+                # (reapplication is idempotent) after a backoff.
+                backoff = self._catchup_restart_backoff()
+                LOG.warning(
+                    "OplogThread: catch-up flush failed; re-reading the "
+                    "oplog from checkpoint %s in %d seconds",
+                    self.checkpoint,
+                    backoff,
+                )
                 with self._catchup_lock:
-                    self._catchup_ops = {}
-                    self._catchup_last_ts = None
-                    self._catchup_first_buffered_at = None
+                    self._discard_catchup_buffer()
+                    self._catchup_restart_required = False
+                last_ts = None
+                self._sleep_while_running(backoff)
 
             # update timestamp before attempting to reconnect to MongoDB,
             # after being join()'ed, or if the cursor closes
@@ -676,7 +957,7 @@ class OplogThread(threading.Thread):
                     "Exception, cursor closing, or join() on this"
                     "thread."
                 )
-                self.update_checkpoint(last_ts)
+                self._advance_checkpoint(last_ts)
 
             LOG.debug(
                 "OplogThread: Sleeping. Documents removed: %d, "
@@ -786,6 +1067,13 @@ class OplogThread(threading.Thread):
 
         fields = include_fields or exclude_fields
         entry_o = entry["o"]
+        # MongoDB >= 5.0 records modifier updates as {"$v": 2, "diff": {...}}.
+        # Field filtering does not understand diff specs, and treating one as
+        # a replacement document would strip it to {}, so leave the entry
+        # intact. Doc managers resolve diff updates from the source document
+        # (and bulk catch-up refetches them with the namespace projection).
+        if entry["op"] == "u" and "diff" in entry_o:
+            return entry
         # Version 3.6 of mongodb includes a $v,
         # see https://jira.mongodb.org/browse/SERVER-32240
         if "$v" in entry_o:
@@ -1167,8 +1455,53 @@ class OplogThread(threading.Thread):
         # first entry has been consumed
         return cursor, cursor_empty
 
+    def _sleep_while_running(self, seconds):
+        """Sleep up to ``seconds``, returning early if the thread stops."""
+        deadline = time.time() + seconds
+        while self.running and time.time() < deadline:
+            time.sleep(min(1, max(deadline - time.time(), 0)))
+
+    def _advance_checkpoint(self, checkpoint):
+        """Move the checkpoint forward to ``checkpoint`` during oplog
+        processing.
+
+        Unlike update_checkpoint (which rollback and cursor initialization
+        use to deliberately move the checkpoint backwards), this refuses to
+        move the checkpoint backwards: a stale timestamp, e.g. one recorded
+        before a bulk flush (possibly from the idle-flush thread) advanced
+        the checkpoint, is ignored. It also refuses to checkpoint while a
+        failed catch-up flush is pending a re-read from the checkpoint.
+
+        Returns True if the checkpoint was updated.
+        """
+        if checkpoint is None:
+            return False
+        with self._catchup_lock:
+            if self._catchup_restart_required:
+                LOG.debug(
+                    "OplogThread: not checkpointing %s while a failed "
+                    "catch-up flush is pending",
+                    checkpoint,
+                )
+                return False
+            if self.checkpoint is not None and _ts_as_long(
+                checkpoint
+            ) <= _ts_as_long(self.checkpoint):
+                LOG.debug(
+                    "OplogThread: not moving checkpoint from %s back to %s",
+                    self.checkpoint,
+                    checkpoint,
+                )
+                return False
+            self.update_checkpoint(checkpoint)
+            return True
+
     def update_checkpoint(self, checkpoint):
         """Store the current checkpoint in the oplog progress dictionary.
+
+        This stores ``checkpoint`` unconditionally (rollback relies on that
+        to move it backwards); forward progress during oplog processing
+        goes through _advance_checkpoint, which never moves it backwards.
         """
         if checkpoint is not None and checkpoint != self.checkpoint:
             self.checkpoint = checkpoint

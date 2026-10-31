@@ -152,9 +152,13 @@ class TestMongoDocManager(MongoTestCase):
             else "test.test"
         )
         meta_coll = self.mongo_conn["__mongo_connector"][collection_name]
+        # Every bulk_upsert in a bulk_apply call is stamped with the minimum
+        # timestamp across the whole ops list, so resuming from the newest
+        # _ts in the target never skips an op of this call.
         meta_doc = meta_coll.find_one({self.id_field: 1})
-        self.assertEqual(meta_doc["_ts"], 4)
+        self.assertEqual(meta_doc["_ts"], 1)
         self.assertIsNone(meta_coll.find_one({self.id_field: 2}))
+        self.assertFalse(self.choosy_docman._in_bulk_apply)
 
     def test_bulk_apply_bad_op_type(self):
         """Test that bulk_apply rejects unknown op types."""

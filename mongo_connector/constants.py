@@ -36,6 +36,13 @@ DEFAULT_MAX_BULK = 1000
 # Default = 300 (5 minutes). 0 disables bulk catch-up mode.
 DEFAULT_BULK_APPLY_LAG_SECONDS = 300
 
+# Lag (in seconds behind the newest oplog entry) at which the connector
+# leaves bulk catch-up mode once it has entered it. Lower than
+# DEFAULT_BULK_APPLY_LAG_SECONDS so the connector does not flap between
+# serial and bulk application around the entry threshold.
+# Default = 60 (1 minute).
+DEFAULT_BULK_APPLY_EXIT_LAG_SECONDS = 60
+
 # Maximum wall-clock seconds buffered catch-up ops may sit unflushed when
 # the batch doesn't fill and the oplog goes quiet. 0 disables the idle
 # flush (buffered ops flush only at batch size or on order barriers).
