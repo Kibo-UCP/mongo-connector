@@ -27,7 +27,10 @@ import pymongo
 sys.path[0:0] = [""]  # noqa
 
 from mongo_connector import errors
-from mongo_connector.doc_managers.doc_manager_base import DocManagerBase
+from mongo_connector.doc_managers.doc_manager_base import (
+    BULK_APPLY_TS_KEY,
+    DocManagerBase,
+)
 from mongo_connector.locking_dict import LockingDict
 from mongo_connector.namespace_config import NamespaceConfig
 from mongo_connector.oplog_manager import (
@@ -213,6 +216,90 @@ class TestDocManagerBaseBulkApply(unittest.TestCase):
 
     def test_catchup_fetch_full_document_default(self):
         self.assertFalse(DocManagerBase.catchup_fetch_full_document)
+
+
+class PerDocTsDocManager(RecordingDocManager):
+    """Opted-in doc manager: pops each doc's own timestamp, as the Kibo
+    Solr doc managers do, and stamps it instead of the batch timestamp."""
+
+    catchup_per_doc_ts = True
+
+    def bulk_upsert(self, docs, namespace, timestamp):
+        stamped = []
+        for doc in docs:
+            stamped.append((doc["_id"], doc.pop(BULK_APPLY_TS_KEY)))
+        if self.bulk_upsert_error is not None:
+            raise self.bulk_upsert_error
+        self.calls.append(("bulk_upsert", stamped, namespace, timestamp))
+
+
+class TestPerDocTimestamps(unittest.TestCase):
+    def setUp(self):
+        self.dm = PerDocTsDocManager()
+
+    def test_each_doc_stamped_with_its_own_ts_in_ascending_order(self):
+        self.dm.bulk_apply([
+            ("upsert", "db.coll", {"_id": "a"}, 9),
+            ("upsert", "db.coll", {"_id": "b"}, 3),
+            ("upsert", "db.coll", {"_id": "c"}, 6),
+        ])
+        (call,) = self.dm.calls_named("bulk_upsert")
+        self.assertEqual(call[1], [("b", 3), ("c", 6), ("a", 9)])
+        # The timestamp argument stays the minimum for the whole call.
+        self.assertEqual(call[3], 3)
+
+    def test_sorted_per_segment_between_removes(self):
+        self.dm.bulk_apply([
+            ("upsert", "db.coll", {"_id": "a"}, 9),
+            ("upsert", "db.coll", {"_id": "b"}, 3),
+            ("remove", "db.coll", "x", 5),
+            ("upsert", "db.coll", {"_id": "d"}, 7),
+            ("upsert", "db.coll", {"_id": "e"}, 6),
+        ])
+        names = [c[0] for c in self.dm.calls]
+        self.assertEqual(names, ["bulk_upsert", "remove", "bulk_upsert"])
+        first, _, second = self.dm.calls
+        self.assertEqual(first[1], [("b", 3), ("a", 9)])
+        self.assertEqual(second[1], [("e", 6), ("d", 7)])
+
+    def test_namespaces_are_ordered_independently(self):
+        self.dm.bulk_apply([
+            ("upsert", "db.one", {"_id": "a"}, 8),
+            ("upsert", "db.two", {"_id": "b"}, 2),
+            ("upsert", "db.one", {"_id": "c"}, 4),
+        ])
+        by_ns = {c[2]: c[1] for c in self.dm.calls_named("bulk_upsert")}
+        self.assertEqual(by_ns["db.one"], [("c", 4), ("a", 8)])
+        self.assertEqual(by_ns["db.two"], [("b", 2)])
+
+    def test_serial_fallback_uses_own_ts_and_no_reserved_key(self):
+        self.dm.bulk_upsert_error = ValueError("boom")
+        self.dm.bulk_apply([
+            ("upsert", "db.coll", {"_id": "a"}, 9),
+            ("upsert", "db.coll", {"_id": "b"}, 3),
+        ])
+        upserts = self.dm.calls_named("upsert")
+        self.assertEqual([(c[1]["_id"], c[3]) for c in upserts],
+                         [("b", 3), ("a", 9)])
+        for c in upserts:
+            self.assertNotIn(BULK_APPLY_TS_KEY, c[1])
+
+    def test_not_opted_in_keeps_minimum_and_no_reserved_key(self):
+        dm = RecordingDocManager()
+        dm.bulk_apply([
+            ("upsert", "db.coll", {"_id": "a"}, 9),
+            ("upsert", "db.coll", {"_id": "b"}, 3),
+        ])
+        (call,) = dm.calls_named("bulk_upsert")
+        self.assertEqual(call[3], 3)
+        self.assertEqual([d["_id"] for d in call[1]], ["a", "b"])
+        for d in call[1]:
+            self.assertNotIn(BULK_APPLY_TS_KEY, d)
+
+    def test_source_docs_not_mutated(self):
+        doc = {"_id": "a"}
+        self.dm.bulk_apply([("upsert", "db.coll", doc, 4)])
+        self.assertEqual(doc, {"_id": "a"})
 
 
 class FakeCursor(object):

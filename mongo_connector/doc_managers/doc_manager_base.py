@@ -25,6 +25,10 @@ from mongo_connector.errors import (
 
 LOG = logging.getLogger(__name__)
 
+# Key under which bulk_apply passes a document's own last-op timestamp to
+# bulk_upsert, for doc managers that set ``catchup_per_doc_ts``.
+BULK_APPLY_TS_KEY = "_bulk_apply_ts"
+
 
 class DocManagerBase(object):
     """Base class for all DocManager implementations."""
@@ -41,6 +45,12 @@ class DocManagerBase(object):
     # managers whose serial update() refetches the full source document, so
     # catch-up produces the same documents as serial application.
     catchup_fetch_full_document = False
+
+    # When True, bulk_apply stamps each document with its own last-op
+    # timestamp (passed to bulk_upsert in the BULK_APPLY_TS_KEY key of each
+    # document) instead of the minimum timestamp of the whole flush. See
+    # bulk_apply() for the contract.
+    catchup_per_doc_ts = False
 
     def apply_update(self, doc, update_spec):
         """Apply an update operation to a document."""
@@ -173,10 +183,24 @@ class DocManagerBase(object):
           buffered documents; every serial fallback ``upsert`` receives a
           fresh shallow copy too, so a doc manager may mutate what it is
           given.
-        - Every ``bulk_upsert`` and fallback ``upsert`` is stamped with the
-          minimum timestamp across the whole ``ops`` list. Restarting from
-          the doc manager's newest ``_ts`` then never skips an op in this
-          call; reapplying ops is idempotent.
+        - By default every ``bulk_upsert`` and fallback ``upsert`` is
+          stamped with the minimum timestamp across the whole ``ops`` list.
+          Restarting from the doc manager's newest ``_ts`` then never skips
+          an op in this call; reapplying ops is idempotent. The cost is that
+          a document's stored timestamp can be older than its last op.
+        - A doc manager that sets ``catchup_per_doc_ts = True`` instead gets
+          each document's own last-op timestamp, as serial application
+          would. Each document passed to ``bulk_upsert`` then carries it in
+          the reserved key ``BULK_APPLY_TS_KEY`` (``"_bulk_apply_ts"``),
+          which ``bulk_upsert`` must pop from the document and use in place
+          of its ``timestamp`` argument. Fallback ``upsert`` calls get the
+          document's own timestamp as their argument and no reserved key.
+          So that a failure partway through still leaves the doc manager's
+          newest ``_ts`` safe to restart from, each namespace's documents
+          are applied in ascending timestamp order between removes: every
+          document not yet applied has a timestamp at or above the newest
+          ``_ts`` already written. ``timestamp`` is still the minimum, for
+          doc managers that do not opt in.
         - If ``bulk_upsert`` raises anything other than
           :class:`~mongo_connector.errors.ConnectionFailed`, the
           namespace's documents are re-applied one at a time with
@@ -192,18 +216,24 @@ class DocManagerBase(object):
         if not ops:
             return
         timestamp = min(op[3] for op in ops)
+        per_doc_ts = bool(getattr(self, "catchup_per_doc_ts", False))
         pending = {}
 
         def flush_pending():
-            for ns, docs in pending.items():
-                self._bulk_apply_upserts(docs, ns, timestamp)
+            for ns, entries in pending.items():
+                if per_doc_ts:
+                    # Stable, so ops with equal timestamps keep their order.
+                    entries.sort(key=lambda e: e[1])
+                self._bulk_apply_upserts(
+                    entries, ns, timestamp, per_doc_ts)
             pending.clear()
 
         self._in_bulk_apply = True
         try:
             for op_type, namespace, payload, op_timestamp in ops:
                 if op_type == "upsert":
-                    pending.setdefault(namespace, []).append(payload)
+                    pending.setdefault(namespace, []).append(
+                        (payload, op_timestamp))
                 else:
                     flush_pending()
                     try:
@@ -217,11 +247,20 @@ class DocManagerBase(object):
         finally:
             self._in_bulk_apply = False
 
-    def _bulk_apply_upserts(self, docs, namespace, timestamp):
-        """Upsert one namespace's docs for bulk_apply via bulk_upsert,
-        falling back to per-document upserts on failure."""
+    def _bulk_apply_upserts(self, entries, namespace, timestamp,
+                            per_doc_ts=False):
+        """Upsert one namespace's ``(doc, op timestamp)`` entries for
+        bulk_apply via bulk_upsert, falling back to per-document upserts on
+        failure."""
+        def batch():
+            for doc, op_ts in entries:
+                copy = dict(doc)
+                if per_doc_ts:
+                    copy[BULK_APPLY_TS_KEY] = op_ts
+                yield copy
+
         try:
-            self.bulk_upsert(iter([dict(d) for d in docs]), namespace, timestamp)
+            self.bulk_upsert(batch(), namespace, timestamp)
             return
         except SystemExit:
             # Some DocManagers call sys.exit() at the end of bulk_upsert
@@ -237,11 +276,12 @@ class DocManagerBase(object):
         except Exception:
             LOG.exception(
                 "bulk_upsert failed during bulk_apply for namespace '%s'; "
-                "applying %d docs serially" % (namespace, len(docs))
+                "applying %d docs serially" % (namespace, len(entries))
             )
-        for doc in docs:
+        for doc, op_ts in entries:
             try:
-                self.upsert(dict(doc), namespace, timestamp)
+                self.upsert(dict(doc), namespace,
+                            op_ts if per_doc_ts else timestamp)
             except OperationFailed:
                 LOG.exception(
                     "Unable to upsert document %r into namespace '%s' "

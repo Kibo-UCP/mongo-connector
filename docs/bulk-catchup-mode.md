@@ -386,7 +386,22 @@ removes keep their existing semantics.
     Kibo's `init_oplog.py` resumes from the target's maximum `_ts`, so a
     newer stamp could make a restart skip older ops in the same call; with
     the minimum, a restart at worst reprocesses ops, which is idempotent.
-    Removes keep their own op timestamp.
+    Removes keep their own op timestamp. The cost is that a document's
+    stored `_ts` can be older than its last op, so a rollback re-sync
+    (`rollback()` searches from the target's maximum `_ts`) could miss a
+    doc modified shortly after the rollback point.
+  - A doc manager MAY opt in to exact per-document timestamps by setting
+    `catchup_per_doc_ts = True` (default False). `bulk_apply` then puts
+    each document's own last-op timestamp in the reserved key
+    `_bulk_apply_ts` (`BULK_APPLY_TS_KEY`) of every document passed to
+    `bulk_upsert`, which MUST pop it and stamp with it instead of its
+    `timestamp` argument (the argument stays the minimum). Fallback
+    `upsert` calls get the document's own timestamp and no reserved key.
+    To keep restart from the target's maximum `_ts` safe, each namespace's
+    upserts between two removes are applied in ascending timestamp order,
+    so an op not yet applied never has a lower timestamp than a `_ts`
+    already written (namespaces are separate indexes, so each is ordered
+    on its own). Both Kibo doc managers opt in.
   - A `SystemExit` raised by `bulk_upsert` MUST be suppressed (safety net),
     falling back to serial `upsert` for that namespace's docs.
 - **FR-009**: Error semantics: if `bulk_upsert` raises `OperationFailed` or
