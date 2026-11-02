@@ -371,22 +371,26 @@ removes keep their existing semantics.
   `{"upsert", "remove"}`; an unknown op type MUST be rejected with
   `ValueError` before any op is applied. The default implementation MUST
   follow this contract, which doc managers rely on:
-  - `self._in_bulk_apply` (class attribute, default `False`) MUST be `True`
-    for the duration of its calls into `bulk_upsert`/`remove`/`upsert` and
-    reset in a `finally`. Reindex-style doc managers use it to skip
+  - `self._in_bulk_apply` (a per-thread property, `False` outside a call)
+    MUST be `True` on the calling thread for the duration of its calls into
+    `bulk_upsert`/`remove`/`upsert` and reset in a `finally`. Reindex-style doc managers use it to skip
     `sys.exit()` and end-of-job logging during catch-up.
   - `bulk_upsert` MUST be called with an iterator of shallow copies,
-    `self.bulk_upsert(iter([dict(d) for d in docs]), ns, ts)`, because doc
+    an iterator yielding `dict(d)` for each buffered doc, because doc
     managers call `next()` on their input and mutate documents (and refuse
     to clean a document twice). Every serial fallback `upsert` (here and in
     `OplogThread`'s fallbacks) MUST receive a fresh shallow copy, and each
     doc manager gets its own copies.
   - Every `bulk_upsert` and fallback `upsert` in one `bulk_apply` call MUST
-    be stamped with the MINIMUM timestamp across the whole `ops` list.
-    Kibo's `init_oplog.py` resumes from the target's maximum `_ts`, so a
-    newer stamp could make a restart skip older ops in the same call; with
-    the minimum, a restart at worst reprocesses ops, which is idempotent.
-    Removes keep their own op timestamp. The cost is that a document's
+    be stamped (unless the doc manager opts in to per-document timestamps,
+    below) with the largest timestamp STRICTLY BELOW the minimum across
+    the whole `ops` list. Kibo's `init_oplog.py` resumes from the target's
+    maximum `_ts`, so a newer stamp could make a restart skip older ops in
+    the same call (stamping at the minimum itself would still skip an
+    unwritten op whose timestamp equals it); with a stamp below the
+    minimum, a restart at worst reprocesses ops, which is idempotent.
+    On this default path removes keep their own op timestamp. The cost is
+    that a document's
     stored `_ts` can be older than its last op, so a rollback re-sync
     (`rollback()` searches from the target's maximum `_ts`) could miss a
     doc modified shortly after the rollback point.
@@ -395,13 +399,24 @@ removes keep their existing semantics.
     each document's own last-op timestamp in the reserved key
     `_bulk_apply_ts` (`BULK_APPLY_TS_KEY`) of every document passed to
     `bulk_upsert`, which MUST pop it and stamp with it instead of its
-    `timestamp` argument (the argument stays the minimum). Fallback
+    `timestamp` argument (the argument stays the restart-safe stamp). Fallback
     `upsert` calls get the document's own timestamp and no reserved key.
-    To keep restart from the target's maximum `_ts` safe, each namespace's
-    upserts between two removes are applied in ascending timestamp order,
-    so an op not yet applied never has a lower timestamp than a `_ts`
-    already written (namespaces are separate indexes, so each is ordered
-    on its own). Both Kibo doc managers opt in.
+    To keep restart from the target's maximum `_ts` safe, upserts between
+    removes are applied in ascending timestamp order across ALL namespaces
+    (one `bulk_upsert` per run of consecutive same-namespace docs), and each
+    doc's timestamp is clamped to just below the smallest timestamp of every
+    op still to be applied after it. At any partial-failure point the
+    newest `_ts` written is then strictly below every unapplied op, in any
+    namespace, even for ops that share a timestamp (an `applyOps`
+    transaction): a restart resumes after the entry at that timestamp, so a
+    tie must never be written ahead of its siblings. Stamps are exact
+    unless ops tie. A doc manager's restart point may be read from one
+    namespace only (Kibo's order-connector `init_oplog.py` reads
+    `cartorder.Order`). Removes are clamped the same way, in case a doc
+    manager's `remove()` records a `_ts`.
+    Worst case, namespaces that alternate on every op degrade to one
+    `bulk_upsert` per document, no worse than serial application.
+    Both Kibo doc managers opt in.
   - A `SystemExit` raised by `bulk_upsert` MUST be suppressed (safety net),
     falling back to serial `upsert` for that namespace's docs.
 - **FR-009**: Error semantics: if `bulk_upsert` raises `OperationFailed` or
@@ -471,7 +486,9 @@ removes keep their existing semantics.
 - **Meta Document**: Per-document bookkeeping written by the mongo doc
   managers (`_id`/`doc_id`, `ns`, `_ts`) in the `__mongo_connector` database.
   During catch-up, documents upserted by one `bulk_apply` call are stamped
-  with the minimum oplog timestamp of that call's ops (FR-008)
+  with a timestamp just below the minimum oplog timestamp of that call's
+  ops, or with their own last-op timestamp for doc managers that set
+  `catchup_per_doc_ts` (FR-008)
 
 ## Success Criteria *(mandatory)*
 
@@ -513,6 +530,17 @@ removes keep their existing semantics.
   doc managers, full) source fetch; serial mode passes the unfiltered
   `diff` spec to `update()`, which the Kibo doc managers handle by
   refetching the source document.
+- `_in_bulk_apply` is tracked per thread (a doc manager instance is shared
+  by all shard threads), so concurrent `bulk_apply` calls do not clear each
+  other's flag. A doc manager must read it on the thread running
+  `bulk_upsert`, which the default `bulk_apply` guarantees.
+- A collection renamed while its updates sit in the catch-up buffer: the
+  buffered modifier update is resolved by a source fetch at flush time,
+  before the rename barrier runs. If the source has already renamed the
+  collection, the fetch finds nothing under the old name and the target
+  document is removed, with no later CRUD entry to restore it. Renames are
+  rare and the connector has never handled them in the target; reindex the
+  affected namespace after a rename that occurred inside a backlog.
 - Non-CRUD sub-operations inside `applyOps` fall back to serial
   `handle_command`, which does not apply them.
 

@@ -438,7 +438,17 @@ class TestOplogManager(unittest.TestCase):
 
         docman.bulk_apply = spy_bulk_apply
         self.opman.bulk_apply_lag_seconds = 1
-        self.opman.bulk_apply_batch_size = 5
+        # The exit threshold is clamped to the entry threshold only at
+        # construction, so lower it too or the first buffered entry (lag ~2s)
+        # would already count as caught up (2 > 60 is false) and leave bulk
+        # mode.
+        self.opman.bulk_apply_exit_lag_seconds = 1
+        # Larger than the ten unique backlog documents, so the transition to
+        # the recent serial entry flushes one deduplicated window.
+        self.opman.bulk_apply_batch_size = 100
+        # Replay the backlog from the start of the oplog instead of dumping
+        # the collection and resuming after the newest entry.
+        self.opman.collection_dump = False
 
         # Write old entries, wait past the lag threshold, then write a
         # recent entry so the earlier entries qualify for bulk apply.
@@ -480,7 +490,7 @@ class TestOplogManager(unittest.TestCase):
             self.assertEqual(updated_docs[0]["x"], 1)
 
             assert_soon(
-                lambda: len(docman._search()) == 11,
+                lambda: len(docman._search()) == 10,
                 "documents were not applied to the doc manager",
             )
         finally:

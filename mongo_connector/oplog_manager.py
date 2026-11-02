@@ -72,6 +72,15 @@ def _ts_as_long(ts):
     return ts
 
 
+def _is_diff_update(update_spec):
+    """True for a MongoDB >= 5.0 ``{"$v": 2, "diff": {...}}`` update envelope.
+
+    A replacement document may legitimately contain a field named ``diff``,
+    so the field name alone is not enough: the envelope also carries ``$v``.
+    """
+    return "diff" in update_spec and "$v" in update_spec
+
+
 def _catchup_doc_key(doc_id):
     """Return a hashable key identifying a document ``_id``.
 
@@ -361,13 +370,19 @@ class OplogThread(threading.Thread):
             sub_ops = o["applyOps"]
             if all(s.get("op") in ("i", "u", "d") for s in sub_ops):
                 for sub in sub_ops:
-                    yield {
+                    expanded = {
                         "op": sub["op"],
                         "ns": sub["ns"],
                         "o": sub.get("o", {}),
                         "o2": sub.get("o2", {}),
                         "ts": entry["ts"],
                     }
+                    # Keep the migration marker so _should_skip_entry still
+                    # drops chunk-move writes, whether it is set on the
+                    # sub-op or on the parent applyOps entry.
+                    if sub.get("fromMigrate") or entry.get("fromMigrate"):
+                        expanded["fromMigrate"] = True
+                    yield expanded
                 return
         yield entry
 
@@ -439,7 +454,7 @@ class OplogThread(threading.Thread):
             if not (
                 "$set" in update_spec
                 or "$unset" in update_spec
-                or "diff" in update_spec
+                or _is_diff_update(update_spec)
             ):
                 # Replacement-style update: 'o' holds the new document.
                 doc = dict(update_spec)
@@ -546,7 +561,11 @@ class OplogThread(threading.Thread):
         skipped, as in serial oplog application; ConnectionFailed is
         propagated so the checkpoint is not advanced past unapplied ops.
         """
-        for op_type, ns, payload, ts in ops:
+        # Buffered ops are in first-seen order, which dedup can leave out of
+        # timestamp order. Apply in timestamp order (stable) so a failure
+        # partway through never leaves the target's newest _ts ahead of an
+        # unapplied op that restart-from-newest-_ts would then skip.
+        for op_type, ns, payload, ts in sorted(ops, key=lambda op: op[3]):
             try:
                 if op_type == "upsert":
                     dm.upsert(dict(payload), ns, ts)
@@ -1072,7 +1091,7 @@ class OplogThread(threading.Thread):
         # a replacement document would strip it to {}, so leave the entry
         # intact. Doc managers resolve diff updates from the source document
         # (and bulk catch-up refetches them with the namespace projection).
-        if entry["op"] == "u" and "diff" in entry_o:
+        if entry["op"] == "u" and _is_diff_update(entry_o):
             return entry
         # Version 3.6 of mongodb includes a $v,
         # see https://jira.mongodb.org/browse/SERVER-32240

@@ -130,7 +130,6 @@ class TestDocManagerBaseBulkApply(unittest.TestCase):
         self.assertEqual(doc, {"_id": 1, "a": 1})
 
     def test_in_bulk_apply_flag(self):
-        self.assertFalse(DocManagerBase._in_bulk_apply)
         self.assertFalse(self.dm._in_bulk_apply)
         self.dm.bulk_apply(
             [
@@ -147,7 +146,7 @@ class TestDocManagerBaseBulkApply(unittest.TestCase):
             self.dm.bulk_apply([("upsert", "db.coll", {"_id": 1}, 5)])
         self.assertFalse(self.dm._in_bulk_apply)
 
-    def test_stamps_upserts_with_minimum_timestamp(self):
+    def test_stamps_upserts_just_below_minimum_timestamp(self):
         self.dm.bulk_apply(
             [
                 ("upsert", "db.a", {"_id": 1}, 30),
@@ -157,7 +156,7 @@ class TestDocManagerBaseBulkApply(unittest.TestCase):
             ]
         )
         bulk_calls = self.dm.calls_named("bulk_upsert")
-        self.assertEqual([c[3] for c in bulk_calls], [10, 10, 10])
+        self.assertEqual([c[3] for c in bulk_calls], [9, 9, 9])
         # Order is preserved around the remove.
         self.assertEqual(
             [c[0] for c in self.dm.calls if c[0] != "bulk_upsert_input"],
@@ -175,7 +174,7 @@ class TestDocManagerBaseBulkApply(unittest.TestCase):
         # Doc 2 is isolated and skipped; the rest are applied with the
         # minimum timestamp, from fresh copies.
         self.assertEqual([c[1]["_id"] for c in upserts], [1, 3])
-        self.assertEqual({c[3] for c in upserts}, {8})
+        self.assertEqual({c[3] for c in upserts}, {7})
         self.assertEqual(docs[0], {"_id": 1, "v": 1})
 
     def test_other_exception_falls_back_to_serial_upserts(self):
@@ -245,8 +244,8 @@ class TestPerDocTimestamps(unittest.TestCase):
         ])
         (call,) = self.dm.calls_named("bulk_upsert")
         self.assertEqual(call[1], [("b", 3), ("c", 6), ("a", 9)])
-        # The timestamp argument stays the minimum for the whole call.
-        self.assertEqual(call[3], 3)
+        # The timestamp argument is the restart-safe stamp for the whole call.
+        self.assertEqual(call[3], 2)
 
     def test_sorted_per_segment_between_removes(self):
         self.dm.bulk_apply([
@@ -259,18 +258,102 @@ class TestPerDocTimestamps(unittest.TestCase):
         names = [c[0] for c in self.dm.calls]
         self.assertEqual(names, ["bulk_upsert", "remove", "bulk_upsert"])
         first, _, second = self.dm.calls
-        self.assertEqual(first[1], [("b", 3), ("a", 9)])
+        # a@9 is clamped to just below the later remove@5 / upserts @6, @7:
+        # stamping it 9 would let a restart skip them if the call stopped.
+        self.assertEqual(first[1], [("b", 3), ("a", 4)])
         self.assertEqual(second[1], [("e", 6), ("d", 7)])
 
-    def test_namespaces_are_ordered_independently(self):
+    def test_namespaces_are_ordered_globally_by_timestamp(self):
+        """Order@10, Blanket@20, Order@30: writing all Order docs first
+        would leave the Order namespace's newest _ts (30) ahead of the
+        unwritten Blanket@20, which a restart from it would then skip."""
+        self.dm.bulk_apply([
+            ("upsert", "db.order", {"_id": "o30"}, 30),
+            ("upsert", "db.blanket", {"_id": "b20"}, 20),
+            ("upsert", "db.order", {"_id": "o10"}, 10),
+        ])
+        calls = [(c[2], c[1]) for c in self.dm.calls_named("bulk_upsert")]
+        self.assertEqual(
+            calls,
+            [
+                ("db.order", [("o10", 10)]),
+                ("db.blanket", [("b20", 20)]),
+                ("db.order", [("o30", 30)]),
+            ],
+        )
+
+    def test_consecutive_same_namespace_docs_share_one_bulk_upsert(self):
         self.dm.bulk_apply([
             ("upsert", "db.one", {"_id": "a"}, 8),
             ("upsert", "db.two", {"_id": "b"}, 2),
             ("upsert", "db.one", {"_id": "c"}, 4),
+            ("upsert", "db.one", {"_id": "d"}, 5),
         ])
-        by_ns = {c[2]: c[1] for c in self.dm.calls_named("bulk_upsert")}
-        self.assertEqual(by_ns["db.one"], [("c", 4), ("a", 8)])
-        self.assertEqual(by_ns["db.two"], [("b", 2)])
+        calls = [(c[2], c[1]) for c in self.dm.calls_named("bulk_upsert")]
+        self.assertEqual(
+            calls,
+            [
+                ("db.two", [("b", 2)]),
+                ("db.one", [("c", 4), ("d", 5), ("a", 8)]),
+            ],
+        )
+
+    def test_equal_timestamps_are_stamped_below_the_tie(self):
+        """applyOps sub-ops share one ts. If one were written with that ts
+        before its siblings, a restart from it would skip the siblings."""
+        self.dm.bulk_apply([
+            ("upsert", "cartorder.Order", {"_id": "o"}, 5),
+            ("upsert", "db.other", {"_id": "x"}, 5),
+        ])
+        stamps = [c[1] for c in self.dm.calls_named("bulk_upsert")]
+        # The first of the tied ops is stamped below the tie; the last, with
+        # nothing left to write after it, keeps its own timestamp.
+        self.assertEqual(stamps, [[("o", 4)], [("x", 5)]])
+
+    def test_partial_failure_never_leaves_newest_ts_above_unwritten_op(self):
+        """Whatever point the call stops at, the newest stamp written is
+        strictly below every op not written."""
+        ops = [
+            ("upsert", "cartorder.Order", {"_id": "o1"}, 10),
+            ("upsert", "db.blanket", {"_id": "b1"}, 20),
+            ("upsert", "cartorder.Order", {"_id": "o2"}, 30),
+            ("upsert", "db.blanket", {"_id": "b2"}, 30),
+        ]
+        for fail_at in range(1, 5):
+            dm = PerDocTsDocManager()
+            original = dm.bulk_upsert
+            seen = []
+
+            def bulk_upsert(docs, namespace, timestamp,
+                            _original=original, _seen=seen, _fail_at=fail_at):
+                docs = list(docs)
+                if len(_seen) + 1 == _fail_at:
+                    raise errors.ConnectionFailed("down")
+                _seen.append((namespace, [(d["_id"], d[BULK_APPLY_TS_KEY])
+                                          for d in docs]))
+                return _original(iter(docs), namespace, timestamp)
+
+            dm.bulk_upsert = bulk_upsert
+            with self.assertRaises(errors.ConnectionFailed):
+                dm.bulk_apply(list(ops))
+            written = {i for _, docs in seen for i, _ in docs}
+            newest = max((t for _, docs in seen for _, t in docs), default=0)
+            for _, _, doc, ts in ops:
+                if doc["_id"] not in written:
+                    self.assertLess(newest, ts)
+
+    def test_removes_are_clamped_like_upserts(self):
+        """A remove that records a _ts must not push the newest _ts past an
+        unwritten op: remove@6 followed by two ops @4 (dedup reordered)."""
+        self.dm.bulk_apply([
+            ("remove", "db.c", "x", 6),
+            ("upsert", "db.c", {"_id": "a"}, 4),
+            ("upsert", "db.c", {"_id": "b"}, 4),
+        ])
+        (remove,) = self.dm.calls_named("remove")
+        self.assertEqual(remove[3], 3)
+        (upsert_call,) = self.dm.calls_named("bulk_upsert")
+        self.assertEqual(upsert_call[1], [("a", 3), ("b", 4)])
 
     def test_serial_fallback_uses_own_ts_and_no_reserved_key(self):
         self.dm.bulk_upsert_error = ValueError("boom")
@@ -284,14 +367,14 @@ class TestPerDocTimestamps(unittest.TestCase):
         for c in upserts:
             self.assertNotIn(BULK_APPLY_TS_KEY, c[1])
 
-    def test_not_opted_in_keeps_minimum_and_no_reserved_key(self):
+    def test_not_opted_in_gets_restart_safe_stamp_and_no_reserved_key(self):
         dm = RecordingDocManager()
         dm.bulk_apply([
             ("upsert", "db.coll", {"_id": "a"}, 9),
             ("upsert", "db.coll", {"_id": "b"}, 3),
         ])
         (call,) = dm.calls_named("bulk_upsert")
-        self.assertEqual(call[3], 3)
+        self.assertEqual(call[3], 2)
         self.assertEqual([d["_id"] for d in call[1]], ["a", "b"])
         for d in call[1]:
             self.assertNotIn(BULK_APPLY_TS_KEY, d)
@@ -1059,6 +1142,180 @@ class TestReplacementUpdates(OplogThreadTestBase):
             self.assertEqual(
                 {op[0] for op in resolved}, {"upsert", "remove"}
             )
+
+
+class TestCopilotReviewFixes(OplogThreadTestBase):
+    """Regressions from the Copilot review of the catch-up PR."""
+
+    def test_apply_ops_expansion_keeps_from_migrate(self):
+        opman = self.make_opman([RecordingDocManager()])
+        sub = sub_insert(1)
+        sub["fromMigrate"] = True
+        parent = apply_ops(5, [sub, sub_insert(2)])
+        expanded = list(opman._expand_apply_ops(parent))
+        self.assertEqual([e.get("fromMigrate") for e in expanded], [True, None])
+        self.assertTrue(opman._should_skip_entry(expanded[0])[0])
+        self.assertFalse(opman._should_skip_entry(expanded[1])[0])
+
+    def test_apply_ops_expansion_propagates_parent_from_migrate(self):
+        opman = self.make_opman([RecordingDocManager()])
+        parent = apply_ops(5, [sub_insert(1), sub_insert(2)])
+        parent["fromMigrate"] = True
+        expanded = list(opman._expand_apply_ops(parent))
+        self.assertTrue(all(e["fromMigrate"] for e in expanded))
+        self.assertTrue(all(opman._should_skip_entry(e)[0] for e in expanded))
+
+    def test_replacement_with_diff_field_is_not_a_modifier_update(self):
+        opman = self.make_opman(
+            [RecordingDocManager()],
+            NamespaceConfig(
+                namespace_options={"test.test": {"excludeFields": ["secret"]}}
+            ),
+        )
+        entry = {
+            "ts": ts(5),
+            "op": "u",
+            "ns": "test.test",
+            "o2": {"_id": 1},
+            "o": {"_id": 1, "diff": "x", "secret": "s"},
+        }
+        self.assertFalse(opman._should_skip_entry(entry)[0])
+        # Filtering ran: the excluded field is gone, the diff field is kept.
+        self.assertEqual(entry["o"], {"_id": 1, "diff": "x"})
+        opman._buffer_oplog_entry(entry, entry["ns"], 5)
+        (op,) = opman._catchup_ops.values()
+        self.assertEqual(op[0], "replace")
+        self.assertEqual(op[2], {"_id": 1, "diff": "x"})
+
+    def test_v2_diff_envelope_still_detected(self):
+        opman = self.make_opman([RecordingDocManager()])
+        entry = {
+            "ts": ts(5),
+            "op": "u",
+            "ns": "test.test",
+            "o2": {"_id": 1},
+            "o": {"$v": 2, "diff": {"u": {"a": 1}}},
+        }
+        opman._buffer_oplog_entry(entry, entry["ns"], 5)
+        (op,) = opman._catchup_ops.values()
+        self.assertEqual(op[:3], ("fetch", "test.test", 1))
+
+    def test_serial_fallback_applies_in_timestamp_order(self):
+        dm = RecordingDocManager()
+        opman = self.make_opman([dm])
+        # Dedup can leave first-seen order out of timestamp order (A@1,
+        # B@2, A@3 buffers A@3 then B@2).
+        opman._apply_ops_serially(
+            dm,
+            [
+                ("upsert", "test.test", {"_id": "A"}, ts(3)),
+                ("upsert", "test.test", {"_id": "B"}, ts(2)),
+                ("remove", "test.test", "C", ts(1)),
+            ],
+        )
+        self.assertEqual(
+            [(c[0], c[3]) for c in dm.calls],
+            [("remove", ts(1)), ("upsert", ts(2)), ("upsert", ts(3))],
+        )
+
+
+class TestBulkApplyFlagThreading(unittest.TestCase):
+    def test_flag_is_per_thread(self):
+        """Concurrent bulk_apply calls on one shared doc manager must not
+        clear each other's flag."""
+        in_first = threading.Event()
+        release_first = threading.Event()
+        seen = {}
+
+        class SlowDocManager(RecordingDocManager):
+            def bulk_upsert(self, docs, namespace, timestamp):
+                docs = list(docs)
+                name = threading.current_thread().name
+                if name == "first":
+                    in_first.set()
+                    release_first.wait(5)
+                seen[name] = self._in_bulk_apply
+                super().bulk_upsert(iter(docs), namespace, timestamp)
+
+        dm = SlowDocManager()
+
+        def run():
+            dm.bulk_apply([("upsert", "db.c", {"_id": 1}, 1)])
+
+        first = threading.Thread(target=run, name="first")
+        first.start()
+        self.assertTrue(in_first.wait(5))
+        # The second thread finishes entirely while the first is mid-call.
+        second = threading.Thread(target=run, name="second")
+        second.start()
+        second.join(5)
+        self.assertFalse(dm._in_bulk_apply)  # this thread isn't in a call
+        release_first.set()
+        first.join(5)
+        self.assertEqual(seen, {"first": True, "second": True})
+        self.assertFalse(dm._in_bulk_apply)
+
+
+class TestInBulkApplyAssignment(unittest.TestCase):
+    def test_assignment_is_idempotent(self):
+        dm = RecordingDocManager()
+        dm._in_bulk_apply = True
+        dm._in_bulk_apply = True
+        dm._in_bulk_apply = False
+        self.assertFalse(dm._in_bulk_apply)
+
+    def test_nested_bulk_apply_keeps_flag_until_outermost_exits(self):
+        dm = RecordingDocManager()
+        states = []
+        original = dm.bulk_upsert
+
+        def bulk_upsert(docs, namespace, timestamp):
+            if not states:
+                states.append(None)
+                dm.bulk_apply([("upsert", "db.c", {"_id": 2}, 2)])
+                states[0] = dm._in_bulk_apply  # still inside the outer call
+            return original(docs, namespace, timestamp)
+
+        dm.bulk_upsert = bulk_upsert
+        dm.bulk_apply([("upsert", "db.c", {"_id": 1}, 1)])
+        self.assertEqual(states, [True])
+        self.assertFalse(dm._in_bulk_apply)
+
+
+class TestRestartSafeStamp(unittest.TestCase):
+    def test_timestamp_before(self):
+        from mongo_connector.doc_managers.doc_manager_base import (
+            _timestamp_before,
+        )
+
+        self.assertEqual(_timestamp_before(5), 4)
+        self.assertEqual(
+            _timestamp_before(bson.Timestamp(10, 3)), bson.Timestamp(10, 2)
+        )
+        self.assertEqual(
+            _timestamp_before(bson.Timestamp(10, 0)),
+            bson.Timestamp(9, 0xFFFFFFFF),
+        )
+        self.assertEqual(
+            _timestamp_before(bson.Timestamp(0, 0)), bson.Timestamp(0, 0)
+        )
+        self.assertLess(
+            bson_ts_to_long(_timestamp_before(bson.Timestamp(10, 0))),
+            bson_ts_to_long(bson.Timestamp(10, 0)),
+        )
+
+    def test_default_stamp_precedes_every_unwritten_op(self):
+        """With A@1, B@2, A@3 deduped to B@2 and A@3, a partial write that
+        stamps A must not hide B@2 from a restart at the newest _ts."""
+        dm = RecordingDocManager()
+        dm.bulk_apply(
+            [
+                ("upsert", "db.c", {"_id": "A"}, bson.Timestamp(3, 0)),
+                ("upsert", "db.c", {"_id": "B"}, bson.Timestamp(2, 0)),
+            ]
+        )
+        (call,) = dm.calls_named("bulk_upsert")
+        self.assertLess(call[3], bson.Timestamp(2, 0))
 
 
 class TestReplicationLagLogger(unittest.TestCase):
