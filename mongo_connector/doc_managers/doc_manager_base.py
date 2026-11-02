@@ -14,16 +14,97 @@
 
 import logging
 import sys
+import threading
+
+from bson.timestamp import Timestamp
 
 from mongo_connector.connector import get_mininum_mongodb_version
-from mongo_connector.errors import UpdateDoesNotApply
+from mongo_connector.errors import (
+    ConnectionFailed,
+    OperationFailed,
+    UpdateDoesNotApply,
+)
 
 
 LOG = logging.getLogger(__name__)
 
+# Key under which bulk_apply passes a document's own last-op timestamp to
+# bulk_upsert, for doc managers that set ``catchup_per_doc_ts``.
+BULK_APPLY_TS_KEY = "_bulk_apply_ts"
+
+
+# Per-thread bulk_apply() nesting depth, keyed by DocManager id. A DocManager
+# instance is shared by all shard threads, so the "in bulk apply" state must
+# be per thread, not per instance.
+_bulk_apply_local = threading.local()
+
+
+def _bulk_apply_depth():
+    depth = getattr(_bulk_apply_local, "depth", None)
+    if depth is None:
+        depth = _bulk_apply_local.depth = {}
+    return depth
+
+
+def _timestamp_before(timestamp):
+    """The largest timestamp strictly below ``timestamp``."""
+    if isinstance(timestamp, Timestamp):
+        if timestamp.inc > 0:
+            return Timestamp(timestamp.time, timestamp.inc - 1)
+        if timestamp.time == 0:
+            return timestamp  # nothing lies below the zero timestamp
+        return Timestamp(timestamp.time - 1, 0xFFFFFFFF)
+    return timestamp - 1
+
 
 class DocManagerBase(object):
     """Base class for all DocManager implementations."""
+
+    # True while the default bulk_apply() is running on the current thread.
+    # Doc managers whose bulk_upsert has one-shot reindex behavior (e.g.
+    # calling sys.exit() or logging end-of-job messages when finished) should
+    # check this flag and skip that behavior during oplog catch-up. It is
+    # tracked per thread, so concurrent bulk_apply calls from different shard
+    # threads on one shared doc manager do not clear each other's flag.
+    @property
+    def _in_bulk_apply(self):
+        return _bulk_apply_depth().get(id(self), 0) > 0
+
+    @_in_bulk_apply.setter
+    def _in_bulk_apply(self, value):
+        # Plain assignment semantics (idempotent), for tests and doc managers
+        # that set the flag directly. bulk_apply itself nests via
+        # _enter_bulk_apply/_exit_bulk_apply.
+        depth = _bulk_apply_depth()
+        if value:
+            depth[id(self)] = max(depth.get(id(self), 0), 1)
+        else:
+            depth.pop(id(self), None)
+
+    def _enter_bulk_apply(self):
+        depth = _bulk_apply_depth()
+        depth[id(self)] = depth.get(id(self), 0) + 1
+
+    def _exit_bulk_apply(self):
+        depth = _bulk_apply_depth()
+        remaining = depth.get(id(self), 0) - 1
+        if remaining > 0:
+            depth[id(self)] = remaining
+        else:
+            depth.pop(id(self), None)
+
+    # When True, OplogThread resolves modifier/diff updates buffered during
+    # bulk catch-up by fetching the WHOLE source document, ignoring the
+    # namespace's includeFields/excludeFields projection. Set this on doc
+    # managers whose serial update() refetches the full source document, so
+    # catch-up produces the same documents as serial application.
+    catchup_fetch_full_document = False
+
+    # When True, bulk_apply stamps each document with its own last-op
+    # timestamp (passed to bulk_upsert in the BULK_APPLY_TS_KEY key of each
+    # document) instead of the minimum timestamp of the whole flush. See
+    # bulk_apply() for the contract.
+    catchup_per_doc_ts = False
 
     def apply_update(self, doc, update_spec):
         """Apply an update operation to a document."""
@@ -126,6 +207,214 @@ class DocManagerBase(object):
         """
         for doc in docs:
             self.upsert(doc, namespace, timestamp)
+
+    def bulk_apply(self, ops):
+        """Apply a sequence of normalized oplog operations.
+
+        ``ops`` is an iterable of ``(op_type, namespace, payload, timestamp)``
+        tuples produced by OplogThread while catching up on a large oplog
+        backlog (see the ``bulkApplyLagSeconds`` option). ``op_type`` is one
+        of:
+
+        - ``"upsert"``: ``payload`` is the full document to upsert. Modifier
+          updates (``$set``/``$unset``/``diff`` oplog entries) are resolved
+          to whole documents by the OplogThread before reaching this method.
+        - ``"remove"``: ``payload`` is the ``_id`` of the document to remove.
+
+        Operations must be applied in the order given. This default
+        implementation routes upsert ops through the existing
+        :meth:`bulk_upsert` method (batching consecutive upserts per
+        namespace, flushed before each remove to preserve ordering) and
+        remove ops through :meth:`remove`. Doc managers may override this
+        for finer-grained batching (e.g. batching removes).
+
+        Contract for doc managers relying on this default implementation:
+
+        - ``self._in_bulk_apply`` is True for the duration of the call, so
+          a doc manager can tell a catch-up ``bulk_upsert`` apart from a
+          one-shot reindex ``bulk_upsert`` (e.g. to skip ``sys.exit()``).
+        - ``bulk_upsert`` receives an *iterator* of shallow copies of the
+          buffered documents; every serial fallback ``upsert`` receives a
+          fresh shallow copy too, so a doc manager may mutate what it is
+          given.
+        - By default every ``bulk_upsert`` and fallback ``upsert`` is
+          stamped with a restart-safe timestamp: the largest timestamp
+          strictly below the minimum across the whole ``ops`` list.
+          Restarting from the doc manager's newest ``_ts`` then never skips
+          an op in this call, even one whose timestamp equals the minimum
+          and is not yet written; reapplying ops is idempotent. The cost is
+          that a document's stored timestamp is older than its last op.
+        - A doc manager that sets ``catchup_per_doc_ts = True`` instead gets
+          each document's own last-op timestamp, as serial application
+          would. Each document passed to ``bulk_upsert`` then carries it in
+          the reserved key ``BULK_APPLY_TS_KEY`` (``"_bulk_apply_ts"``),
+          which ``bulk_upsert`` must pop from the document and use in place
+          of its ``timestamp`` argument. Fallback ``upsert`` calls get the
+          document's own timestamp as their argument and no reserved key.
+          So that a failure partway through still leaves the doc manager's
+          newest ``_ts`` safe to restart from, documents are applied in
+          ascending timestamp order between removes, across all namespaces
+          (one ``bulk_upsert`` per run of consecutive same-namespace
+          documents), and a document's timestamp is clamped to just below
+          the smallest timestamp of every op still to be applied after it.
+          Every unapplied op then has a timestamp strictly above the newest
+          ``_ts`` already written, in any namespace, even for ops sharing a
+          timestamp. Timestamps are exact unless ops tie. ``timestamp`` is still the restart-safe
+          timestamp, for doc managers that do not opt in.
+        - If ``bulk_upsert`` raises anything other than
+          :class:`~mongo_connector.errors.ConnectionFailed`, the
+          namespace's documents are re-applied one at a time with
+          :meth:`upsert` so a bad document is isolated; a single document's
+          :class:`~mongo_connector.errors.OperationFailed` is logged and
+          skipped, as in serial oplog application. ``ConnectionFailed`` is
+          propagated so the caller does not checkpoint past unapplied ops.
+        """
+        ops = list(ops)
+        for op in ops:
+            if op[0] not in ("upsert", "remove"):
+                raise ValueError("Unknown bulk_apply op type: %r" % (op[0],))
+        if not ops:
+            return
+        timestamp = _timestamp_before(min(op[3] for op in ops))
+        per_doc_ts = bool(getattr(self, "catchup_per_doc_ts", False))
+
+        self._enter_bulk_apply()
+        try:
+            if per_doc_ts:
+                self._bulk_apply_per_doc(ops, timestamp)
+            else:
+                self._bulk_apply_batched(ops, timestamp)
+        finally:
+            self._exit_bulk_apply()
+
+    def _bulk_apply_batched(self, ops, timestamp):
+        """Default bulk_apply: batch upserts per namespace, flushed before
+        each remove, every upsert stamped with the restart-safe ``timestamp``.
+        """
+        pending = {}
+
+        def flush_pending():
+            for ns, entries in pending.items():
+                self._bulk_apply_upserts(entries, ns, timestamp)
+            pending.clear()
+
+        for op_type, namespace, payload, op_timestamp in ops:
+            if op_type == "upsert":
+                pending.setdefault(namespace, []).append(
+                    (payload, op_timestamp))
+            else:
+                flush_pending()
+                self._bulk_apply_remove(payload, namespace, op_timestamp)
+        flush_pending()
+
+    def _bulk_apply_per_doc(self, ops, timestamp):
+        """bulk_apply for doc managers with ``catchup_per_doc_ts``.
+
+        Writes in a fixed plan order: between removes, upserts of ALL
+        namespaces sorted by timestamp (stable), each run of consecutive
+        same-namespace upserts going out as one bulk_upsert. A document (or
+        remove) is stamped with its own timestamp, clamped to just below the smallest
+        timestamp of every op still to be written after it, so at every
+        partial-failure point the newest ``_ts`` written is strictly below
+        the timestamp of every unwritten op. Restarting from it (which
+        resumes after the entry at that timestamp) then never skips one,
+        even for ops sharing a timestamp (an applyOps transaction) and even
+        when the doc manager reads its restart point from a single
+        namespace. For distinct timestamps the clamp changes nothing, so
+        stamps are exact.
+        """
+        plan = []  # (op_type, namespace, payload, timestamp), write order
+        segment = []
+        for op in ops:
+            if op[0] == "upsert":
+                segment.append(op)
+            else:
+                plan.extend(sorted(segment, key=lambda o: o[3]))
+                segment = []
+                plan.append(op)
+        plan.extend(sorted(segment, key=lambda o: o[3]))
+
+        # Smallest timestamp among the ops after each plan position.
+        after = [None] * len(plan)
+        smallest = None
+        for i in range(len(plan) - 1, -1, -1):
+            after[i] = smallest
+            ts = plan[i][3]
+            smallest = ts if smallest is None or ts < smallest else smallest
+
+        run_ns, run = None, []
+
+        def flush_run():
+            if run:
+                self._bulk_apply_upserts(run[:], run_ns, timestamp, True)
+                del run[:]
+
+        for i, (op_type, namespace, payload, op_timestamp) in enumerate(plan):
+            stamp = op_timestamp
+            if after[i] is not None and after[i] <= stamp:
+                stamp = _timestamp_before(after[i])
+            if op_type == "upsert":
+                if run and namespace != run_ns:
+                    flush_run()
+                run_ns = namespace
+                run.append((payload, stamp))
+            else:
+                # A remove is clamped like an upsert: a doc manager whose
+                # remove() records a _ts must not push the newest _ts past
+                # an unwritten op either.
+                flush_run()
+                self._bulk_apply_remove(payload, namespace, stamp)
+        flush_run()
+
+    def _bulk_apply_remove(self, document_id, namespace, timestamp):
+        try:
+            self.remove(document_id, namespace, timestamp)
+        except OperationFailed:
+            LOG.exception(
+                "Unable to remove document %r from namespace '%s' during "
+                "bulk_apply" % (document_id, namespace)
+            )
+
+    def _bulk_apply_upserts(self, entries, namespace, timestamp,
+                            per_doc_ts=False):
+        """Upsert one namespace's ``(doc, op timestamp)`` entries for
+        bulk_apply via bulk_upsert, falling back to per-document upserts on
+        failure."""
+        def batch():
+            for doc, op_ts in entries:
+                copy = dict(doc)
+                if per_doc_ts:
+                    copy[BULK_APPLY_TS_KEY] = op_ts
+                yield copy
+
+        try:
+            self.bulk_upsert(batch(), namespace, timestamp)
+            return
+        except SystemExit:
+            # Some DocManagers call sys.exit() at the end of bulk_upsert
+            # (one-shot reindex semantics). Suppress it during catch-up and
+            # apply this namespace's docs serially, since their state after
+            # the exit is unknown.
+            LOG.warning(
+                "bulk_upsert raised SystemExit during bulk_apply "
+                "for namespace '%s'; applying docs serially" % namespace
+            )
+        except ConnectionFailed:
+            raise
+        except Exception:
+            LOG.exception(
+                "bulk_upsert failed during bulk_apply for namespace '%s'; "
+                "applying %d docs serially" % (namespace, len(entries))
+            )
+        for doc, op_ts in entries:
+            try:
+                self.upsert(dict(doc), namespace,
+                            op_ts if per_doc_ts else timestamp)
+            except OperationFailed:
+                LOG.exception(
+                    "Unable to upsert document %r into namespace '%s' "
+                    "during bulk_apply" % (doc.get("_id"), namespace)
+                )
 
     def update(self, doc, update_spec, namespace, timestamp):
         """Update a document.
